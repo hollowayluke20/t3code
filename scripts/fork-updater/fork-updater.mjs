@@ -13,13 +13,17 @@ const LOCK_STALE_MS = 3 * HOUR_MS;
 const FAILED_TAG_RETRY_MS = 6 * HOUR_MS;
 const BUSY_WAIT_NOTIFY_MS = 12 * HOUR_MS;
 const HEALTH_TIMEOUT_MS = 150_000;
+const DEFAULT_RUN_TIMEOUT_MS = 5 * 60_000;
+const SQLITE3_BIN = "/usr/bin/sqlite3";
+const PROJECTS_QUERY =
+  "select project_id as id, title, workspace_root as workspaceRoot from projection_projects";
 const BUSY_THREAD_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 const HISTORY_LIMIT = 50;
 
 const DEFAULTS = {
   forkUpdaterHome: "~/.t3-fork-updater",
   t3Home: "~/.t3",
-  t3Bin: "~/.t3/bin/t3",
+  t3Bin: "~/.local/bin/t3",
   servicePort: 3773,
   forkRepo: "~/Development/t3code-luke",
   forkBranch: "feat/mic-button",
@@ -103,6 +107,7 @@ function emptyState() {
     waitingSince: null,
     waitingNotifiedFor: null,
     lastDownNotifyAt: null,
+    lastCrashNotifyAt: null,
   };
 }
 
@@ -146,6 +151,15 @@ const silentLogger = {
   error: async () => {},
   step: async () => {},
 };
+
+function stderrLogger(env) {
+  return {
+    info: async () => {},
+    step: async () => {},
+    warn: async (message) => printErr(env, `WARN ${message}`),
+    error: async (message) => printErr(env, `ERROR ${message}`),
+  };
+}
 
 async function loadState(env, logger = silentLogger) {
   const file = statePath(env.config);
@@ -534,49 +548,56 @@ function parseJsonArray(text) {
       if (Array.isArray(parsed.threads)) return parsed.threads;
     }
   } catch {
-    // Not JSON; the caller may fall back to text parsing.
+    // Not JSON; the caller treats unreadable output as unsafe and waits.
   }
   return null;
 }
 
+function fallbackProject(config) {
+  return [{ id: config.notifyProject, workspaceRoot: config.notifyProject, title: "" }];
+}
+
 async function listProjects(env, logger) {
-  const listed = await env.run(env.config.t3Bin, ["project", "list", "--json"], {
-    timeoutMs: 30_000,
-  });
-  if (listed.status === 0) {
-    const projects = parseJsonArray(listed.stdout);
-    if (projects !== null) {
-      return projects.map((project) => ({
-        id: project.id ?? project.projectId ?? project.workspaceRoot ?? project.path,
-        workspaceRoot: project.workspaceRoot ?? project.path ?? project.id,
-        title: project.title ?? "",
-      }));
-    }
+  const config = env.config;
+  const sandbox = config.switchMode === "sandbox";
+  const database = path.join(config.t3Home, "userdata", "statev2.sqlite");
+  if (sandbox && !(await env.fs.exists(database))) {
+    await logger.warn(`sandbox database ${database} does not exist; no projects to check`);
+    return [];
   }
-  const text = await env.run(env.config.t3Bin, ["project", "list"], { timeoutMs: 30_000 });
-  if (text.status === 0) {
-    const projects = [];
-    for (const line of String(text.stdout ?? "").split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (trimmed === "" || /^no projects\b/i.test(trimmed) || trimmed.startsWith("-")) continue;
-      const tokens = trimmed.split(/\s{2,}|\t+/);
-      if (tokens.length < 2) continue;
-      if (
-        ["id", "project", "projects", "title", "name", "workspace", "path"].includes(
-          tokens[0].toLowerCase(),
-        )
-      ) {
-        continue;
-      }
-      const workspaceRoot = tokens.find((token) => token.startsWith("/")) ?? tokens.at(-1);
-      projects.push({ id: tokens[0], workspaceRoot, title: tokens[1] ?? "" });
-    }
-    if (projects.length > 0) return projects;
-  }
-  await logger.warn(
-    `t3 project list is unavailable here (${oneLine(combineOutput(listed)) || "no output"}); checking only ${env.config.notifyProject}`,
+  const listed = await env.run(
+    SQLITE3_BIN,
+    ["-readonly", `file:${database}?mode=ro`, "-json", PROJECTS_QUERY],
+    { timeoutMs: 30_000 },
   );
-  return [{ id: env.config.notifyProject, workspaceRoot: env.config.notifyProject, title: "" }];
+  const rows = (listed.status ?? 0) === 0 ? parseJsonArray(listed.stdout) : null;
+  if (rows === null || rows.length === 0) {
+    const detail = oneLine(combineOutput(listed)) || "no output";
+    if (sandbox) {
+      await logger.warn(`could not read projects from ${database} (${detail})`);
+      return [];
+    }
+    await logger.warn(
+      `could not read projects from ${database} (${detail}); checking only ${config.notifyProject}`,
+    );
+    return fallbackProject(config);
+  }
+  const projects = [];
+  for (const row of rows) {
+    const id = row?.id ?? row?.projectId ?? row?.workspaceRoot;
+    if (id === undefined || id === null || String(id) === "") continue;
+    projects.push({
+      id: String(id),
+      workspaceRoot: String(row.workspaceRoot ?? row.workspace_root ?? id),
+      title: String(row.title ?? ""),
+    });
+  }
+  if (projects.length === 0) {
+    if (sandbox) return [];
+    await logger.warn(`no projects found in ${database}; checking only ${config.notifyProject}`);
+    return fallbackProject(config);
+  }
+  return projects;
 }
 
 async function busyThreads(env, logger) {
@@ -1351,6 +1372,7 @@ async function commandStatus(env) {
   const config = env.config;
   const state = await loadState(env);
   const lines = ["T3 fork updater", `  home: ${config.home}`, `  mode: ${config.switchMode}`];
+  lines.push(`  t3 binary: ${config.t3Bin}`);
   lines.push(`  installed fork version: ${state.current ?? "none"}`);
 
   const cli = await env.run(config.t3Bin, ["--version"], { timeoutMs: 15_000 });
@@ -1439,6 +1461,49 @@ async function commandCheck(env) {
   return { exitCode: 0 };
 }
 
+async function commandBusy(env) {
+  const busy = await busyThreads(env, stderrLogger(env));
+  printOut(env, JSON.stringify(busy, null, 2));
+  return { exitCode: 0 };
+}
+
+async function handleTickCrash(env, logger, error) {
+  const detail = oneLine(error?.message ?? String(error));
+  try {
+    await bestEffort(logger, "logging an unexpected tick error", () =>
+      logger.error(`unexpected error during tick: ${oneLine(error?.stack ?? detail)}`),
+    );
+    const state = await loadState(env);
+    state.lastRun = {
+      result: "fail",
+      message: `unexpected error: ${detail}`,
+      at: env.now().toISOString(),
+    };
+    const now = env.now().getTime();
+    const lastNotified = state.lastCrashNotifyAt ? Date.parse(state.lastCrashNotifyAt) : 0;
+    if (!Number.isFinite(lastNotified) || now - lastNotified >= FAILED_TAG_RETRY_MS) {
+      state.lastCrashNotifyAt = env.now().toISOString();
+      await bestEffort(logger, "notifying about an unexpected tick error", () =>
+        env.notify({
+          kind: "fail",
+          title: "T3 updater crashed",
+          message: `T3 updater crashed: ${detail}. Reply to acknowledge in one short line.`,
+        }),
+      );
+    }
+    await bestEffort(logger, "saving state after an unexpected tick error", () =>
+      saveState(env, state),
+    );
+  } catch (secondary) {
+    await bestEffort(logger, "reporting a tick error handler failure", () =>
+      logger.error(
+        `could not handle the tick error (${oneLine(secondary?.message ?? String(secondary))})`,
+      ),
+    );
+  }
+  return { exitCode: 1, result: "crashed" };
+}
+
 function printOut(env, line) {
   if (env.out) env.out(line);
   else process.stdout.write(`${line}\n`);
@@ -1466,6 +1531,7 @@ export async function main(argv = process.argv.slice(2), env = createSystemEnv()
   }
   if (command === "status") return commandStatus(env);
   if (command === "check") return commandCheck(env);
+  if (command === "busy") return commandBusy(env);
   if (!["run-now", "rollback", "tick"].includes(command)) {
     printErr(env, `unknown command: ${command}`);
     usage(env);
@@ -1480,11 +1546,12 @@ export async function main(argv = process.argv.slice(2), env = createSystemEnv()
     return { exitCode: 2 };
   }
 
-  await env.fs.mkdir(env.config.home);
   const logger = createLogger(env);
-  const lock = await acquireLock(env, logger);
-  if (lock === null) return { exitCode: 0, result: "locked" };
+  let lock = null;
   try {
+    await env.fs.mkdir(env.config.home);
+    lock = await acquireLock(env, logger);
+    if (lock === null) return { exitCode: 0, result: "locked" };
     const state = await loadState(env, logger);
     if (command === "rollback") {
       return performRollback(env, logger, state, { reason: "manual rollback", manual: true });
@@ -1495,8 +1562,11 @@ export async function main(argv = process.argv.slice(2), env = createSystemEnv()
       return runPipeline(env, logger, state, { force: false, ignoreBackoff: false });
     }
     return runPipeline(env, logger, state, { force, ignoreBackoff: true });
+  } catch (error) {
+    if (command === "tick") return handleTickCrash(env, logger, error);
+    throw error;
   } finally {
-    await lock.release();
+    if (lock !== null) await lock.release();
   }
 }
 
@@ -1528,11 +1598,12 @@ function systemRun(command, args, options = {}) {
     child.unref();
     return { status: child.pid ? 0 : 1, stdout: "", stderr: "", pid: child.pid ?? null };
   }
+  const timeoutMs = options.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   const result = NodeChildProcess.spawnSync(command, args, {
     cwd: options.cwd,
     env,
     encoding: "utf8",
-    timeout: options.timeoutMs,
+    timeout: timeoutMs,
     killSignal: "SIGTERM",
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -1541,7 +1612,7 @@ function systemRun(command, args, options = {}) {
     status: timedOut ? 124 : (result.status ?? (result.error ? 1 : 0)),
     stdout: result.stdout ?? "",
     stderr: timedOut
-      ? `${result.stderr ?? ""}\n[timed out after ${options.timeoutMs}ms]`.trim()
+      ? `${result.stderr ?? ""}\n[timed out after ${timeoutMs}ms]`.trim()
       : (result.stderr ?? ""),
     error: result.error?.message,
   };

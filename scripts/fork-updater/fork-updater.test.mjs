@@ -108,7 +108,7 @@ function config(overrides = {}) {
       HOME: BASE,
       FORK_UPDATER_HOME: `${BASE}/updater`,
       T3_HOME: `${BASE}/t3home`,
-      T3_BIN: `${BASE}/t3bin/t3`,
+      T3_BIN: `${BASE}/.local/bin/t3`,
       SERVICE_PORT: "3773",
       FORK_REPO: `${BASE}/fork`,
       FORK_BRANCH: "feat/mic-button",
@@ -203,6 +203,8 @@ function makeRunner(configuration, options = {}) {
     busy: options.busy ?? false,
     healthDown: options.healthDown ?? options.serviceDown ?? false,
     rollbackFails: options.rollbackFails ?? false,
+    sqliteFail: options.sqliteFail ?? false,
+    projects: options.projects ?? [{ id: "p1", title: "Project", workspaceRoot: "/tmp/project" }],
   };
   const isVp = (command) => command === "vp" || command.endsWith("/vp");
   const run = async (command, args) => {
@@ -246,6 +248,10 @@ function makeRunner(configuration, options = {}) {
     if (command === "python3") return { ...ok(), pid: 4242 };
     if (command === "kill") return ok();
     if (command === "launchctl") return failed("Could not find service");
+    if (command === "/usr/bin/sqlite3") {
+      if (flags.sqliteFail) return failed("Error: unable to open database file");
+      return ok(JSON.stringify(flags.projects));
+    }
     if (command === configuration.t3Bin) {
       if (args[0] === "update") {
         const version = args[1];
@@ -260,9 +266,6 @@ function makeRunner(configuration, options = {}) {
         return ok(`T3 Code service\n  Status: installed · t3@${flags.installed}\n`);
       }
       if (args[0] === "service" && args[1] === "restart") return ok();
-      if (args[0] === "project" && args[1] === "list") {
-        return ok(JSON.stringify([{ id: "p1", title: "Project", workspaceRoot: "/tmp/project" }]));
-      }
       if (args[0] === "thread" && args[1] === "list") {
         return ok(
           JSON.stringify(
@@ -560,6 +563,153 @@ test("sandbox mode updates with --base-dir and restarts the sandbox server", asy
     true,
   );
   assert.equal(harness.readState().current, NEW_VERSION);
+});
+
+test("the default t3 binary is the pinned runtime launcher", () => {
+  const loaded = loadConfig({ HOME: "/Users/example" });
+  assert.equal(loaded.t3Bin, "/Users/example/.local/bin/t3");
+});
+
+test("status shows the t3 binary it would run", async () => {
+  const harness = createReleaseHarness();
+  const result = await main(["status"], harness.env);
+  assert.equal(result.exitCode, 0);
+  assert.equal(
+    harness.output.join("\n").split("\n").includes(`  t3 binary: ${harness.config.t3Bin}`),
+    true,
+  );
+});
+
+test("busy reads projects from the sqlite database and lists busy threads", async () => {
+  const harness = createReleaseHarness({ busy: true });
+  const result = await main(["busy"], harness.env);
+  assert.equal(result.exitCode, 0);
+  const sqlite = harness.calls.find(({ command }) => command === "/usr/bin/sqlite3");
+  assert.notEqual(sqlite, undefined);
+  assert.deepEqual(sqlite.args.slice(0, 3), [
+    "-readonly",
+    `file:${BASE}/t3home/userdata/statev2.sqlite?mode=ro`,
+    "-json",
+  ]);
+  assert.match(sqlite.args[3], /from projection_projects/);
+  const threadList = harness.calls.find(
+    ({ command, args }) =>
+      command === harness.config.t3Bin && args[0] === "thread" && args[1] === "list",
+  );
+  assert.deepEqual(threadList.args, ["thread", "list", "--project", "p1", "--json"]);
+  assert.equal(
+    harness.calls.some(
+      ({ command, args }) => command === harness.config.t3Bin && args[0] === "project",
+    ),
+    false,
+  );
+  assert.deepEqual(JSON.parse(harness.output.join("\n")), [
+    { project: "Project", title: "Busy thread", status: "running" },
+  ]);
+});
+
+test("a failed sqlite read falls back to checking only the notify project", async () => {
+  const harness = createReleaseHarness({ sqliteFail: true });
+  const result = await main(["run-now"], harness.env);
+  assert.equal(result.result, "ok");
+  assert.match(harness.readLog(), /could not read projects .*checking only .*project/);
+  const threadList = harness.calls.find(
+    ({ command, args }) =>
+      command === harness.config.t3Bin && args[0] === "thread" && args[1] === "list",
+  );
+  assert.equal(
+    threadList.args[threadList.args.indexOf("--project") + 1],
+    harness.config.notifyProject,
+  );
+  assert.equal(
+    harness.calls.some(
+      ({ command, args }) => command === harness.config.t3Bin && args[0] === "project",
+    ),
+    false,
+  );
+});
+
+test("sandbox mode checks nothing when its database is absent", async () => {
+  const harness = createReleaseHarness({
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+  });
+  const result = await main(["busy"], harness.env);
+  assert.equal(result.exitCode, 0);
+  assert.equal(harness.output.at(-1), "[]");
+  assert.equal(
+    harness.calls.some(({ command }) => command === "/usr/bin/sqlite3"),
+    false,
+  );
+  assert.equal(
+    harness.calls.some(
+      ({ command, args }) => command === harness.config.t3Bin && args[0] === "thread",
+    ),
+    false,
+  );
+});
+
+test("sandbox mode reads its own database when present", async () => {
+  const harness = createReleaseHarness({
+    busy: true,
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+    files: {
+      [`${BASE}/sandbox-t3home/userdata/statev2.sqlite`]: "",
+    },
+  });
+  const result = await main(["busy"], harness.env);
+  assert.equal(result.exitCode, 0);
+  const sqlite = harness.calls.find(({ command }) => command === "/usr/bin/sqlite3");
+  assert.equal(sqlite.args[1], `file:${BASE}/sandbox-t3home/userdata/statev2.sqlite?mode=ro`);
+  assert.deepEqual(JSON.parse(harness.output.join("\n")), [
+    { project: "Project", title: "Busy thread", status: "running" },
+  ]);
+});
+
+test("every external command in the pipeline carries a timeout", async () => {
+  const harness = createReleaseHarness();
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const untimed = harness.calls.filter(({ opts }) => typeof opts?.timeoutMs !== "number");
+  assert.deepEqual(untimed, []);
+});
+
+test("an unexpected tick error is logged and notifies at most once per six hours", async () => {
+  const configuration = config();
+  const runner = makeRunner(configuration);
+  const harness = createHarness({
+    configuration,
+    state: initialState(),
+    run: runner.run,
+    httpGet: async () => {
+      throw new Error("boom");
+    },
+  });
+  const first = await main(["tick"], harness.env);
+  assert.equal(first.result, "crashed");
+  assert.equal(first.exitCode, 1);
+  assert.match(harness.readLog(), /unexpected error during tick/);
+  assert.match(harness.readLog(), /boom/);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].kind, "fail");
+  assert.notEqual(harness.readState().lastCrashNotifyAt, null);
+
+  const second = await main(["tick"], harness.env);
+  assert.equal(second.result, "crashed");
+  assert.equal(harness.notifications.length, 1);
+
+  const later = createHarness({
+    configuration,
+    state: harness.readState(),
+    clock: START + 7 * 60 * 60 * 1000,
+    run: runner.run,
+    httpGet: async () => {
+      throw new Error("boom again");
+    },
+  });
+  const third = await main(["tick"], later.env);
+  assert.equal(third.result, "crashed");
+  assert.equal(later.notifications.length, 1);
+  assert.match(later.notifications[0].message, /boom again/);
 });
 
 test("SANDBOX-FINDINGS.txt selects the version scheme", async () => {
