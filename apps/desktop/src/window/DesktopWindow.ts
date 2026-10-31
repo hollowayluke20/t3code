@@ -27,6 +27,7 @@ import {
   TRACKPAD_SCROLL_END_CHANNEL,
   WINDOW_FULLSCREEN_STATE_CHANNEL,
 } from "../ipc/channels.ts";
+import { installMediaPermissionHandlers } from "../permissions/MediaPermission.ts";
 import { PASSKEY_BRIDGE_ARGUMENT } from "../preview/GuestProtocol.ts";
 import * as PreviewManager from "../preview/Manager.ts";
 import * as PreviewPasskeys from "../preview/Passkeys.ts";
@@ -408,6 +409,17 @@ export const make = Effect.gen(function* () {
     }
 
     yield* rendererHistory.register(window.webContents, { surface: "main" });
+    installMediaPermissionHandlers(window.webContents.session, {
+      platform: environment.platform,
+      appOrigins: [
+        applicationUrl,
+        ...Option.match(environment.devServerUrl, {
+          onNone: () => [],
+          onSome: (devServerUrl) => [devServerUrl.href],
+        }),
+      ],
+      systemPreferences: Electron.systemPreferences,
+    });
     if (environment.platform === "darwin") {
       window.setAutoHideCursor(false);
     }
