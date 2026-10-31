@@ -558,6 +558,16 @@ test("sandbox mode updates with --base-dir and restarts the sandbox server", asy
     ({ command, args }) => command.includes("/runtime/versions/") && args[0] === "serve",
   );
   assert.notEqual(serve, undefined);
+  assert.deepEqual(serve.args, [
+    "serve",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "3773",
+    "--base-dir",
+    `${BASE}/sandbox-t3home`,
+    "--no-browser",
+  ]);
   assert.equal(
     harness.calls.some(({ command, args }) => command === "kill" && args[0] === "4242"),
     true,

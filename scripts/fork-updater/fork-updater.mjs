@@ -833,9 +833,11 @@ async function restartSandboxServer(env, logger, version) {
     binary,
     [
       "serve",
+      "--host",
+      "127.0.0.1",
       "--port",
       String(env.config.servicePort),
-      "--home-dir",
+      "--base-dir",
       env.config.t3Home,
       "--no-browser",
     ],
