@@ -1,0 +1,251 @@
+# Manual release for Luke's public fork. Builds an unsigned Windows x64 NSIS
+# installer and, when `mac` is set, a best-effort unsigned macOS arm64 DMG/zip,
+# then publishes them as a normal GitHub Release on this repository. No secrets
+# are used, so neither artifact is signed and Windows SmartScreen will warn.
+name: Fork release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the v prefix (for example 0.1.6-luke.1). The release tag is v<version>."
+        required: true
+        type: string
+      mac:
+        description: "Also build the unsigned macOS arm64 DMG/zip (best effort)."
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build Windows x64 installer
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      # Public T3 Connect identifiers, plus the update feed, so the bundle and
+      # app-update.yml point at this fork instead of pingdotgg/t3code.
+      - name: Load public configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+              "" | \#*) continue ;;
+            esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done < scripts/fork-updater/public-config.env
+          printf 'T3CODE_DESKTOP_UPDATE_REPOSITORY=%s\n' "$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve pnpm store path
+        id: pnpm_store
+        shell: pwsh
+        run: '"path=$(vp pm cache dir)" >> $env:GITHUB_OUTPUT'
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: fork-release-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Align package versions
+        shell: bash
+        run: node scripts/update-release-package-versions.ts "${{ inputs.version }}"
+
+      - name: Ensure Electron runtime
+        run: vp run --filter "@t3tools/desktop" ensure:electron
+
+      - name: Build desktop bundles
+        shell: bash
+        run: vp run build:desktop
+
+      - name: Build Windows installer
+        shell: bash
+        run: vp run dist:desktop:artifact --platform win --target nsis --arch x64 --build-version "${{ inputs.version }}" --skip-build --verbose
+
+      - name: Check release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh release/*.exe release/*.blockmap release/latest.yml
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: |
+            release/*.exe
+            release/*.blockmap
+            release/latest.yml
+          if-no-files-found: error
+
+  mac:
+    name: Build macOS arm64 DMG (best effort)
+    if: inputs.mac
+    runs-on: macos-15
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Load public configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            case "$line" in
+              "" | \#*) continue ;;
+            esac
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+          done < scripts/fork-updater/public-config.env
+          printf 'T3CODE_DESKTOP_UPDATE_REPOSITORY=%s\n' "$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Resolve pnpm store path
+        id: pnpm_store
+        shell: bash
+        run: echo "path=$(vp pm cache dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.pnpm_store.outputs.path }}
+          key: fork-release-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install dependencies
+        run: vp install
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+
+      - name: Align package versions
+        shell: bash
+        run: node scripts/update-release-package-versions.ts "${{ inputs.version }}"
+
+      - name: Ensure Electron runtime
+        run: vp run --filter "@t3tools/desktop" ensure:electron
+
+      - name: Build desktop bundles
+        shell: bash
+        run: vp run build:desktop
+
+      # No --signed: without Apple credentials the app is not signed or
+      # notarized, which release-desktop.yml also allows.
+      - name: Build macOS DMG and zip
+        shell: bash
+        run: vp run dist:desktop:artifact --platform mac --target dmg --arch arm64 --build-version "${{ inputs.version }}" --skip-build --verbose
+
+      - name: Check release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh release/*.dmg release/*.zip release/*.blockmap release/latest-mac.yml
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac-arm64
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest-mac.yml
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [windows, mac]
+    if: always() && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: v${{ inputs.version }}
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: release-assets
+
+      - name: Download macOS installer (best effort)
+        if: inputs.mac
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: mac-arm64
+          path: release-assets
+
+      # The app's updater only follows normal "latest" releases, so this is
+      # never a prerelease. A rerun replaces assets on the existing release.
+      - name: Publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh release-assets
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber release-assets/*
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --prerelease=false --latest
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "T3 Code (Luke fork) ${{ inputs.version }}" \
+              --notes "Unsigned fork build of T3 Code with the composer microphone button. Windows SmartScreen will warn because the installer is not code signed." \
+              --target "$GITHUB_SHA" \
+              --latest \
+              release-assets/*
+          fi
