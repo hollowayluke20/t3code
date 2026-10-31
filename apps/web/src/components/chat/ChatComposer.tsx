@@ -279,6 +279,8 @@ import {
 } from "./preparingComposerImages";
 import { ComposerControlsBar } from "./ComposerControlsBar";
 import { composerCommandKeyHandler } from "./composerCommandKey";
+import { MicButton } from "../../voice/MicButton";
+import { useVoiceInput } from "../../voice/useVoiceInput";
 
 function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
   const armed = Date.now() <= deadline.current;
@@ -1252,6 +1254,57 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const setPrompt = (nextPrompt: string) => {
     setComposerDraftPrompt(composerDraftTarget, nextPrompt);
   };
+
+  const commitVoiceTranscript = (text: string, selection: { start: number; end: number }) => {
+    const expandedCursor = expandCollapsedComposerCursor(
+      text,
+      selection.start,
+      isLiteralPendingAnswer,
+    );
+    const activeQuestion = activePendingProgress?.activeQuestion;
+    if (activeQuestion && activePendingUserInput) {
+      onChangeActivePendingUserInputCustomAnswer(
+        activeQuestion.id,
+        text,
+        selection.start,
+        expandedCursor,
+        false,
+      );
+    } else {
+      promptRef.current = text;
+      setPrompt(text);
+      onTypingGuardDraftChange();
+    }
+    setComposerCursor(selection.start);
+    setComposerTrigger(isLiteralPendingAnswer ? null : detectComposerTrigger(text, expandedCursor));
+    window.requestAnimationFrame(() => composerEditorRef.current?.focusAt(selection.start));
+  };
+
+  const voiceInput = useVoiceInput({
+    ownerKey: composerDraftTargetKey,
+    readText: () => {
+      const snapshot = composerEditorRef.current?.readSnapshot();
+      if (snapshot) return snapshot.value;
+      return activePendingProgress ? activePendingProgress.customAnswer : promptRef.current;
+    },
+    readSelection: () => {
+      const range = composerEditorRef.current?.readSelectionRange();
+      return range ?? { start: composerCursor, end: composerCursor };
+    },
+    commitText: commitVoiceTranscript,
+    subscribeToDraftChanges: (listener) => useComposerDraftStore.subscribe(listener),
+  });
+
+  const voiceInputDisabled =
+    projectSelectionRequired || isChoiceOnlyPendingQuestion || activePendingIsResponding;
+  const handleVoiceInputKeyDown = (event: React.KeyboardEvent<HTMLFormElement>) => {
+    if (voiceInputDisabled || event.altKey || !event.shiftKey) return;
+    if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "m") return;
+    event.preventDefault();
+    event.stopPropagation();
+    void voiceInput.toggle();
+  };
+  const handleVoiceInputKeyDownStable = useStableCallback(handleVoiceInputKeyDown);
 
   const addComposerImage = (image: ComposerImageAttachment) =>
     addComposerDraftImages(attachmentDraftTarget, [image]);
@@ -3093,6 +3146,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     <form
       ref={composerFormRef}
       onSubmit={submitComposerStable}
+      onKeyDownCapture={handleVoiceInputKeyDownStable}
       onFocusCapture={(event) => {
         const activeElement = event.target;
         if (
@@ -3450,6 +3504,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   >
                     {composerControls}
                   </div>
+                  <MicButton
+                    phase={voiceInput.state.phase}
+                    error={voiceInput.state.error}
+                    elapsedSeconds={voiceInput.elapsedSeconds}
+                    onToggle={() => void voiceInput.toggle()}
+                    disabled={voiceInputDisabled}
+                  />
                   <ComposerFooterPrimaryActions
                     compact={isComposerPrimaryActionsCompact}
                     canOperateThread={canOperateThread}
