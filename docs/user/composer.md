@@ -174,6 +174,19 @@ Stashes containing uploaded files must be restored in their original environment
 Those files are retained for 24 hours. After an upload expires, restore the prompt
 and use **Attach again** or remove the missing file before sending.
 
+## Voice input
+
+On web and desktop, use the microphone button in the composer or press
+`Cmd+Shift+M` on macOS (`Ctrl+Shift+M` elsewhere) to start dictation, and use it
+again to stop. The transcript is inserted where your selection was and stays in
+the draft for you to review before sending. Microphone access requires HTTPS or
+localhost.
+
+The environment's server transcribes with whisper.cpp, so audio goes only to your
+own T3 server. It needs `whisper-cli` on its `PATH` or in `~/.t3-voice/bin`, and a
+model in `~/.t3-voice/models/ggml-*.bin`; the server's `T3CODE_WHISPER_BIN` and
+`T3CODE_WHISPER_MODEL` environment variables override those paths.
+
 ## Voice input on iPhone
 
 On supported iPhones with iOS 26 or later, use the composer's microphone to record,
