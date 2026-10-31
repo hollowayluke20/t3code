@@ -112,6 +112,7 @@ import {
   PersistChatAttachmentsInput,
   PersistChatAttachmentsResult,
 } from "./chatAttachment.ts";
+import { VoiceTranscribeError, VoiceTranscribeInput, VoiceTranscribeResult } from "./voice.ts";
 import {
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetTurnDiffError,
@@ -426,6 +427,8 @@ export const WS_METHODS = {
   assetsPersistChatAttachments: "assets.persistChatAttachments",
   attachmentsCreateUploadUrl: "attachments.createUploadUrl",
   attachmentsDelete: "attachments.delete",
+
+  voiceTranscribe: "voice.transcribe",
 
   mcpAppsCallTool: "mcpApps.callTool",
   mcpAppsToolInfo: "mcpApps.toolInfo",
@@ -1404,6 +1407,12 @@ const WsAttachmentsDeleteRpc = Rpc.make(WS_METHODS.attachmentsDelete, {
   error: EnvironmentAuthorizationError,
 });
 
+const WsVoiceTranscribeRpc = Rpc.make(WS_METHODS.voiceTranscribe, {
+  payload: VoiceTranscribeInput,
+  success: VoiceTranscribeResult,
+  error: Schema.Union([VoiceTranscribeError, EnvironmentAuthorizationError]),
+});
+
 const WsMcpAppsCallToolRpc = Rpc.make(WS_METHODS.mcpAppsCallTool, {
   payload: McpAppCallToolInput,
   success: McpAppCallToolResult,
@@ -2103,6 +2112,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsAssetsPersistChatAttachmentsRpc,
   WsAttachmentsCreateUploadUrlRpc,
   WsAttachmentsDeleteRpc,
+  WsVoiceTranscribeRpc,
   WsMcpAppsCallToolRpc,
   WsMcpAppsToolInfoRpc,
   WsMcpAppsReadResourceRpc,
