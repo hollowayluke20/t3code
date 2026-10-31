@@ -18,6 +18,9 @@ const SERVER_STOP_TIMEOUT_MS = 60_000;
 const SERVER_KILL_TIMEOUT_MS = 10_000;
 const SERVER_START_TIMEOUT_MS = 30_000;
 const SERVER_POLL_MS = 500;
+const CONNECT_TIMEOUT_MS = 30_000;
+const CONNECT_RECOVERY_TIMEOUT_MS = 90_000;
+const CONNECT_POLL_MS = 5_000;
 const DEFAULT_RUN_TIMEOUT_MS = 5 * 60_000;
 const SQLITE3_BIN = "/usr/bin/sqlite3";
 const PROJECTS_QUERY =
@@ -853,6 +856,34 @@ async function getRunningVersion(env, version) {
   return match ? match[1] : null;
 }
 
+async function readConnectState(env) {
+  const result = await env.run(env.config.t3Bin, ["status", "--json"], {
+    timeoutMs: CONNECT_TIMEOUT_MS,
+  });
+  if ((result.status ?? 0) !== 0) {
+    return {
+      ok: false,
+      connect: null,
+      detail: oneLine(combineOutput(result)) || "t3 status --json failed",
+    };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(String(result.stdout ?? "").trim());
+  } catch {
+    return { ok: false, connect: null, detail: "t3 status --json did not print JSON" };
+  }
+  return { ok: true, connect: parsed?.connect ?? null, detail: "" };
+}
+
+function formatConnect(state) {
+  if (!state.ok) return `unknown (${state.detail})`;
+  if (state.connect === null) return "not available in this build";
+  if (state.connect.enabled === true) return "on";
+  if (state.connect.revoked === true) return "off (revoked)";
+  return "off";
+}
+
 async function startReleaseServer(env, logger, version) {
   const config = env.config;
   const probe = `/v${version}/SHA256SUMS`;
@@ -1088,7 +1119,7 @@ async function restartSandboxServer(env, logger, version) {
   throw await sandboxStartFailure(env, result);
 }
 
-async function waitUntil(env, reason, timeoutMs, attempt) {
+async function waitUntil(env, reason, timeoutMs, attempt, pollMs = 2_000) {
   const deadline = env.now().getTime() + timeoutMs;
   let detail = "";
   while (true) {
@@ -1098,11 +1129,35 @@ async function waitUntil(env, reason, timeoutMs, attempt) {
     if (env.now().getTime() >= deadline) {
       throw new HealthFailure(reason, detail);
     }
-    await env.sleep(2_000);
+    await env.sleep(pollMs);
   }
 }
 
-async function healthCheck(env, logger, version, { featureChecks = true } = {}) {
+async function waitForConnect(env, logger) {
+  await logger.step("health check: T3 Connect");
+  await waitUntil(
+    env,
+    "T3 Connect went offline",
+    CONNECT_RECOVERY_TIMEOUT_MS,
+    async () => {
+      const state = await readConnectState(env);
+      return {
+        ok: state.ok && state.connect !== null,
+        value: state.connect,
+        detail: state.ok ? "t3 status reports T3 Connect is no longer configured" : state.detail,
+      };
+    },
+    CONNECT_POLL_MS,
+  );
+  await logger.info("health check: T3 Connect is still on");
+}
+
+async function healthCheck(
+  env,
+  logger,
+  version,
+  { featureChecks = true, expectConnect = null } = {},
+) {
   const config = env.config;
   const origin = `http://127.0.0.1:${config.servicePort}/`;
   await logger.step(`health check: GET ${origin}`);
@@ -1134,6 +1189,10 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
       };
     },
   );
+
+  if (config.switchMode === "service" && expectConnect !== null) {
+    await waitForConnect(env, logger);
+  }
 
   if (!featureChecks) {
     await logger.info(`health check passed for ${version} (feature checks skipped)`);
@@ -1565,6 +1624,19 @@ async function runPipeline(env, logger, state, { force, ignoreBackoff }) {
   }
   if (previousVersion && previousVersion !== version) state.previous = previousVersion;
 
+  let connectBefore = null;
+  if (config.switchMode === "service") {
+    const recorded = await readConnectState(env);
+    if (!recorded.ok) {
+      await logger.warn(`could not read T3 Connect before the switch: ${recorded.detail}`);
+    } else if (recorded.connect !== null) {
+      connectBefore = recorded.connect;
+      await logger.info("T3 Connect is on; it must stay on after the switch");
+    } else {
+      await logger.info("T3 Connect is off; not checking it after the switch");
+    }
+  }
+
   try {
     const releaseServer = await startReleaseServer(env, logger, version);
     try {
@@ -1575,7 +1647,7 @@ async function runPipeline(env, logger, state, { force, ignoreBackoff }) {
     } finally {
       await releaseServer.stop();
     }
-    await healthCheck(env, logger, version);
+    await healthCheck(env, logger, version, { expectConnect: connectBefore });
   } catch (error) {
     let reason;
     let details;
@@ -1744,6 +1816,7 @@ async function commandStatus(env) {
   const cliVersion =
     cli.status === 0 ? (/v[0-9][^\s]*/.exec(combineOutput(cli))?.[0] ?? "unknown") : "unknown";
   lines.push(`  t3 CLI version: ${cliVersion}`);
+  lines.push(`  T3 Connect: ${formatConnect(await readConnectState(env))}`);
 
   try {
     const latest = await getLatestStableTag(env);

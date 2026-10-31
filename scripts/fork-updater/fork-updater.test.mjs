@@ -220,6 +220,9 @@ function makeRunner(configuration, options = {}) {
     rollbackFails: options.rollbackFails ?? false,
     sqliteFail: options.sqliteFail ?? false,
     transcriptionFails: options.transcriptionFails ?? false,
+    connectBefore: options.connectBefore ?? null,
+    connectAfter:
+      options.connectAfter !== undefined ? options.connectAfter : (options.connectBefore ?? null),
     projects: options.projects ?? [{ id: "p1", title: "Project", workspaceRoot: "/tmp/project" }],
   };
   const clockRef = options.clockRef ?? { now: START };
@@ -330,6 +333,16 @@ function makeRunner(configuration, options = {}) {
       return ok(JSON.stringify(flags.projects));
     }
     if (command === configuration.t3Bin) {
+      if (args[0] === "status" && args[1] === "--json") {
+        const connect = flags.installed === OLD_VERSION ? flags.connectBefore : flags.connectAfter;
+        return ok(
+          JSON.stringify({
+            service: { supported: true, installed: true, installedVersion: flags.installed },
+            connect,
+            lan: { enabled: false, inheritedDefault: false, hostOverride: null },
+          }),
+        );
+      }
       if (args[0] === "update") {
         const version = args[1];
         if (version === OLD_VERSION && flags.rollbackFails) {
@@ -644,6 +657,55 @@ test("a health check failure rolls back and names the previous version", async (
   assert.equal(harness.readState().current, OLD_VERSION);
 });
 
+test("the switch succeeds when T3 Connect stays on", async () => {
+  const harness = createReleaseHarness({
+    connectBefore: { enabled: true, revoked: false },
+    connectAfter: { enabled: true, revoked: false },
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const statuses = harness.calls.filter(
+    ({ command, args }) =>
+      command === harness.config.t3Bin && args[0] === "status" && args[1] === "--json",
+  );
+  assert.equal(statuses.length, 2);
+  assert.equal(harness.notifications.at(-1).kind, "ok");
+});
+
+test("T3 Connect going offline rolls back and notifies FAIL", async () => {
+  const harness = createReleaseHarness({
+    connectBefore: { enabled: true, revoked: false },
+    connectAfter: null,
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "rolled-back");
+  assert.equal(harness.updateCalls().length, 2);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].kind, "fail");
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: T3 Connect went offline, still on 0.1.6-luke.1",
+  );
+  assert.match(harness.notifications[0].message, /Rolled back to 0\.1\.6-luke\.1/);
+  const statuses = harness.calls.filter(
+    ({ command, args }) =>
+      command === harness.config.t3Bin && args[0] === "status" && args[1] === "--json",
+  );
+  assert.ok(statuses.length > 2);
+  assert.equal(harness.readState().current, OLD_VERSION);
+});
+
+test("T3 Connect that was already off is not checked after the switch", async () => {
+  const harness = createReleaseHarness({ connectBefore: null });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const statuses = harness.calls.filter(
+    ({ command, args }) =>
+      command === harness.config.t3Bin && args[0] === "status" && args[1] === "--json",
+  );
+  assert.equal(statuses.length, 1);
+});
+
 test("a failed rollback keeps the failure title short and explains it in the body", async () => {
   const harness = createReleaseHarness({ healthDown: true, rollbackFails: true });
   const result = await main(["run-now", "--force"], harness.env);
@@ -930,14 +992,15 @@ test("the default t3 binary is the pinned runtime launcher", () => {
   assert.equal(loaded.t3Bin, "/Users/example/.local/bin/t3");
 });
 
-test("status shows the t3 binary it would run", async () => {
-  const harness = createReleaseHarness();
+test("status shows the t3 binary it would run and the T3 Connect state", async () => {
+  const harness = createReleaseHarness({
+    connectBefore: { enabled: true, revoked: false },
+  });
   const result = await main(["status"], harness.env);
   assert.equal(result.exitCode, 0);
-  assert.equal(
-    harness.output.join("\n").split("\n").includes(`  t3 binary: ${harness.config.t3Bin}`),
-    true,
-  );
+  const lines = harness.output.join("\n").split("\n");
+  assert.equal(lines.includes(`  t3 binary: ${harness.config.t3Bin}`), true);
+  assert.equal(lines.includes("  T3 Connect: on"), true);
 });
 
 test("busy reads projects from the sqlite database and lists busy threads", async () => {
