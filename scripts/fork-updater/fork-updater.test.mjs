@@ -159,16 +159,16 @@ function createHarness(options = {}) {
   const calls = [];
   const notifications = [];
   const output = [];
-  let clock = options.clock ?? START;
+  const clockRef = options.clockRef ?? { now: options.clock ?? START };
   const env = {
     config: configuration,
     fs,
-    now: () => new Date(clock),
+    now: () => new Date(clockRef.now),
     sleep: async (milliseconds) => {
-      clock += milliseconds;
+      clockRef.now += milliseconds;
     },
     run: async (command, args, opts = {}) => {
-      calls.push({ command, args: [...args], opts });
+      calls.push({ command, args: [...args], opts, at: clockRef.now });
       const result = await options.run(command, args, opts);
       if (
         (command === "vp" || command.endsWith("/vp")) &&
@@ -177,6 +177,10 @@ function createHarness(options = {}) {
         opts.cwd
       ) {
         await fs.writeFile(path.join(opts.cwd, "node_modules", ".bin", "vp"), "");
+      }
+      if (opts.logFile && result.pid) {
+        const lines = options.serveLogLines ?? [`sandbox server pid ${result.pid} started`];
+        await fs.appendFile(opts.logFile, `${lines.join("\n")}\n`);
       }
       return result;
     },
@@ -194,6 +198,7 @@ function createHarness(options = {}) {
     calls,
     notifications,
     output,
+    clockRef,
     readState: () =>
       JSON.parse(fs.files.get(path.join(configuration.home, "state.json")) ?? "null"),
     readLog: () => fs.files.get(path.join(configuration.home, "updater.log")) ?? "",
@@ -216,6 +221,36 @@ function makeRunner(configuration, options = {}) {
     sqliteFail: options.sqliteFail ?? false,
     transcriptionFails: options.transcriptionFails ?? false,
     projects: options.projects ?? [{ id: "p1", title: "Project", workspaceRoot: "/tmp/project" }],
+  };
+  const clockRef = options.clockRef ?? { now: START };
+  const sandbox = configuration.switchMode === "sandbox";
+  const oldServer = {
+    pid: options.sandboxPid ?? null,
+    alive: options.sandboxPid !== undefined && options.sandboxPid !== null,
+    readyAt: Number.NEGATIVE_INFINITY,
+    exitAt: null,
+    ignoresSigterm: options.oldServerIgnoresSigterm ?? false,
+    exitAfterMs: options.oldServerExitAfterMs ?? 0,
+  };
+  let newServer = null;
+  let serveStarts = 0;
+  const processFor = (pid) => {
+    if (oldServer.pid !== null && Number(pid) === oldServer.pid) return oldServer;
+    if (newServer !== null && Number(pid) === newServer.pid) return newServer;
+    return null;
+  };
+  const aliveNow = (server) => {
+    if (!server?.alive) return false;
+    if (server.exitAt !== null && clockRef.now >= server.exitAt) {
+      server.exitAt = null;
+      server.alive = false;
+    }
+    return true;
+  };
+  const sandboxAnswers = () => {
+    if (flags.healthDown) return false;
+    if (aliveNow(oldServer)) return true;
+    return aliveNow(newServer) && clockRef.now >= newServer.readyAt;
   };
   const isVp = (command) => command === "vp" || command.endsWith("/vp");
   const run = async (command, args) => {
@@ -268,7 +303,27 @@ function makeRunner(configuration, options = {}) {
       return ok("built archive\n");
     }
     if (command === "python3") return { ...ok(), pid: 4242 };
-    if (command === "kill") return ok();
+    if (command === "kill") {
+      const signal = args.length > 1 ? args[0] : "";
+      const pid = args.at(-1);
+      const server = processFor(pid);
+      if (signal === "-0") return server && aliveNow(server) ? ok() : failed("no such process");
+      if (server === null) return ok();
+      if (signal === "-9") {
+        server.alive = false;
+        server.exitAt = null;
+        return ok();
+      }
+      if (server.ignoresSigterm) return ok();
+      if (aliveNow(server)) {
+        if (server.exitAfterMs > 0) server.exitAt = clockRef.now + server.exitAfterMs;
+        else {
+          server.alive = false;
+          server.exitAt = null;
+        }
+      }
+      return ok();
+    }
     if (command === "launchctl") return failed("Could not find service");
     if (command === "/usr/bin/sqlite3") {
       if (flags.sqliteFail) return failed("Error: unable to open database file");
@@ -304,35 +359,73 @@ function makeRunner(configuration, options = {}) {
         return ok("thread-1\n");
       }
       if (args[0] === "voice" && args[1] === "transcribe") {
-        if (flags.transcriptionFails) return ok("unintelligible speech\n");
-        return ok("hello from the mac mini\n");
+        return failed("Usage: t3 <command> [options]\n\nCommands:\n  update [version]\n");
       }
       if (args[0] === "--version") return ok(`t3 v${flags.installed}\n`);
     }
     if (command.includes("/runtime/versions/") && command.endsWith("/t3")) {
       if (args[0] === "--version") return ok(`t3 v${flags.installed}\n`);
-      if (args[0] === "serve") return { ...ok(), pid: 5000 };
+      if (args[0] === "serve") {
+        serveStarts += 1;
+        newServer = {
+          pid: 5000 + serveStarts,
+          alive: true,
+          readyAt: clockRef.now,
+          exitAt: null,
+          ignoresSigterm: false,
+          exitAfterMs: 0,
+        };
+        if (options.newServerDiesOnce && serveStarts === 1) {
+          newServer.exitAt = clockRef.now + (options.newServerDiesAfterMs ?? 500);
+          newServer.readyAt = clockRef.now + 2_000;
+        }
+        return { ...ok(), pid: newServer.pid };
+      }
+      if (args[0] === "voice" && args[1] === "transcribe") {
+        if (flags.transcriptionFails) {
+          return failed(
+            [
+              "Usage: t3 <command> [options]",
+              "",
+              "Commands:",
+              "  update [version]",
+              "  service status|restart",
+              "  thread list|start",
+            ].join("\n"),
+          );
+        }
+        return ok("hello from the mac mini\n");
+      }
     }
     return ok();
   };
   const httpGet = async (url) => {
     if (url.startsWith("http://127.0.0.1:3773/")) {
+      if (sandbox) return sandboxAnswers() ? { status: 200, body: "ok" } : { status: 0, body: "" };
       return flags.healthDown ? { status: 0, body: "" } : { status: 200, body: "ok" };
     }
     return { status: 200, body: "release listing" };
   };
-  return { run, httpGet, flags };
+  return { run, httpGet, flags, clockRef };
 }
 
 function createReleaseHarness(options = {}) {
   const configuration = config(options.config);
-  const runner = makeRunner(configuration, options);
+  const sandboxPidFile = path.join(configuration.home, "sandbox.pid");
+  const rawSandboxPid = options.files?.[sandboxPidFile];
+  const sandboxPid =
+    rawSandboxPid !== undefined && /^\d+$/.test(String(rawSandboxPid).trim())
+      ? Number(String(rawSandboxPid).trim())
+      : null;
+  const runner = makeRunner(configuration, { ...options, sandboxPid });
   return createHarness({
     configuration,
     state: options.state ?? initialState(),
     run: runner.run,
     httpGet: runner.httpGet,
     files: options.files,
+    clockRef: runner.clockRef,
+    serveLogLines: options.serveLogLines,
   });
 }
 
@@ -584,7 +677,7 @@ test("a focused test failure names the failing path and shows the test summary",
   assert.match(harness.readLog(), /TypeError/);
 });
 
-test("a transcription failure notifies with a short title and detail in the body", async () => {
+test("a transcription failure notifies with a short title and the first stderr lines", async () => {
   const harness = createReleaseHarness({ transcriptionFails: true });
   const result = await main(["run-now", "--force"], harness.env);
   assert.equal(result.result, "rolled-back");
@@ -593,8 +686,31 @@ test("a transcription failure notifies with a short title and detail in the body
     "T3 update FAILED: transcription check failed, still on 0.1.6-luke.1",
   );
   const body = harness.notifications[0].message;
-  assert.match(body, /unintelligible speech/);
+  assert.match(body, /Usage: t3 <command> \[options\] \| Commands: \| update \[version\]/);
+  assert.doesNotMatch(body, /service status\|restart/);
+  assert.doesNotMatch(body, /thread list\|start/);
   assert.match(body, /Rolled back to 0\.1\.6-luke\.1/);
+});
+
+test("the transcription check runs the version binary, not the launcher", async () => {
+  const harness = createReleaseHarness();
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const transcriptions = harness.calls.filter(
+    ({ args }) => args[0] === "voice" && args[1] === "transcribe",
+  );
+  assert.equal(transcriptions.length, 1);
+  assert.equal(
+    transcriptions[0].command,
+    path.join(harness.config.t3Home, "runtime", "versions", NEW_VERSION, "t3"),
+  );
+  assert.deepEqual(transcriptions[0].args, ["voice", "transcribe", harness.config.testWav]);
+  assert.equal(
+    harness.calls.some(
+      ({ command, args }) => command === harness.config.t3Bin && args[0] === "voice",
+    ),
+    false,
+  );
 });
 
 test("a down service is restarted once and then reported", async () => {
@@ -731,7 +847,82 @@ test("sandbox mode updates with --base-dir and restarts the sandbox server", asy
     harness.calls.some(({ command, args }) => command === "kill" && args[0] === "4242"),
     true,
   );
+  const transcription = harness.calls.find(
+    ({ args }) => args[0] === "voice" && args[1] === "transcribe",
+  );
+  assert.notEqual(transcription, undefined);
+  assert.equal(transcription.command, `${BASE}/sandbox-t3home/runtime/versions/${NEW_VERSION}/t3`);
+  assert.deepEqual(transcription.args, ["voice", "transcribe", harness.config.testWav]);
   assert.equal(harness.readState().current, NEW_VERSION);
+});
+
+test("sandbox restart waits for a slow graceful exit before starting the new server", async () => {
+  const harness = createReleaseHarness({
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+    files: { [`${BASE}/updater/sandbox.pid`]: "4242\n" },
+    oldServerExitAfterMs: 30_000,
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const term = harness.calls.find(({ command, args }) => command === "kill" && args[0] === "4242");
+  const serve = harness.calls.find(
+    ({ command, args }) => command.includes("/runtime/versions/") && args[0] === "serve",
+  );
+  assert.ok(serve.at >= term.at + 30_000);
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "kill" && args[0] === "-9"),
+    false,
+  );
+});
+
+test("sandbox restart SIGKILLs an old server that ignores SIGTERM", async () => {
+  const harness = createReleaseHarness({
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+    files: { [`${BASE}/updater/sandbox.pid`]: "4242\n" },
+    oldServerIgnoresSigterm: true,
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const term = harness.calls.find(({ command, args }) => command === "kill" && args[0] === "4242");
+  const kill9 = harness.calls.find(
+    ({ command, args }) => command === "kill" && args[0] === "-9" && args[1] === "4242",
+  );
+  assert.notEqual(kill9, undefined);
+  assert.ok(kill9.at - term.at >= 60_000);
+  const serve = harness.calls.find(
+    ({ command, args }) => command.includes("/runtime/versions/") && args[0] === "serve",
+  );
+  assert.ok(serve.at >= kill9.at);
+});
+
+test("sandbox restart retries once when the new server exits", async () => {
+  const serveLogLines = [
+    "boot line one",
+    "listen line two",
+    "error line three",
+    "detail line four",
+    "detail line five",
+    "detail line six",
+  ];
+  const harness = createReleaseHarness({
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+    files: { [`${BASE}/updater/sandbox.pid`]: "4242\n" },
+    newServerDiesOnce: true,
+    serveLogLines,
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const serves = harness.calls.filter(
+    ({ command, args }) => command.includes("/runtime/versions/") && args[0] === "serve",
+  );
+  assert.equal(serves.length, 2);
+  const updaterLog = harness.readLog();
+  assert.match(updaterLog, /listen line two/);
+  assert.match(updaterLog, /detail line six/);
+  assert.doesNotMatch(updaterLog, /boot line one/);
+  const serverLog = harness.fs.files.get(`${BASE}/updater/sandbox-server.log`);
+  assert.match(serverLog, /detail line six/);
+  assert.equal(harness.fs.files.get(`${BASE}/updater/sandbox.pid`).trim(), "5002");
 });
 
 test("the default t3 binary is the pinned runtime launcher", () => {
