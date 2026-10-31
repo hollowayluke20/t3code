@@ -9,6 +9,8 @@ import {
 } from "./runtimeModeConfig";
 import { isLocalEnvironmentDisabled } from "../../localEnvironment";
 import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { voiceTranscribe } from "../../state/voice";
 import { useRightPanelStore } from "~/rightPanelStore";
 import { importPastedComposerText, readPastedComposerContext } from "../composerInlineTokenPaste";
 import {
@@ -280,6 +282,7 @@ import {
 import { ComposerControlsBar } from "./ComposerControlsBar";
 import { composerCommandKeyHandler } from "./composerCommandKey";
 import { MicButton } from "../../voice/MicButton";
+import { createEnvironmentVoiceTranscriber } from "../../voice/environmentTranscriber";
 import { useVoiceInput } from "../../voice/useVoiceInput";
 
 function consumePasteAsTextShortcut(deadline: { current: number }): boolean {
@@ -1280,8 +1283,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     window.requestAnimationFrame(() => composerEditorRef.current?.focusAt(selection.start));
   };
 
+  const transcribeVoice = useAtomCommand(voiceTranscribe, { reportFailure: false });
+  const getComposerVoiceTranscriber = () =>
+    createEnvironmentVoiceTranscriber(async (input) => {
+      const result = await transcribeVoice({ environmentId, input });
+      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      return result.value;
+    });
+
   const voiceInput = useVoiceInput({
     ownerKey: composerDraftTargetKey,
+    getTranscriber: getComposerVoiceTranscriber,
     readText: () => {
       const snapshot = composerEditorRef.current?.readSnapshot();
       if (snapshot) return snapshot.value;
@@ -1296,7 +1308,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   });
 
   const voiceInputDisabled =
-    projectSelectionRequired || isChoiceOnlyPendingQuestion || activePendingIsResponding;
+    !canOperateThread ||
+    projectSelectionRequired ||
+    isChoiceOnlyPendingQuestion ||
+    activePendingIsResponding;
   const handleVoiceInputKeyDown = (event: React.KeyboardEvent<HTMLFormElement>) => {
     if (voiceInputDisabled || event.altKey || !event.shiftKey) return;
     if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "m") return;

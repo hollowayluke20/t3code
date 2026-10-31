@@ -2,6 +2,7 @@ import {
   VOICE_RECORDING_LIMIT_SECONDS,
   VoiceInputController,
   voiceInputBlocksSubmission,
+  VoiceTranscriptionError,
   type VoiceDraftSnapshot,
   type VoiceInputState,
   type VoiceRecorder,
@@ -16,7 +17,6 @@ import {
   releaseVoiceRecorder,
   revokeVoiceRecordingUri,
 } from "./browserRecorder";
-import { getVoiceTranscriber } from "./transcriberRegistry";
 
 export const VOICE_INPUT_UNAVAILABLE_MESSAGE = "Voice input is not available on this server.";
 
@@ -46,7 +46,7 @@ export type VoiceInputSessionOptions = {
 export type VoiceInputOptions = {
   readonly ownerKey: string;
   readonly recorder?: VoiceRecorder;
-  readonly getTranscriber?: () => VoiceTranscriber | null;
+  readonly getTranscriber: () => VoiceTranscriber | null;
   readonly requestPermission?: () => Promise<{
     readonly granted: boolean;
     readonly canAskAgain: boolean;
@@ -77,6 +77,7 @@ export class ComposerVoiceInput {
   private previousText: string | null = null;
   private unsubscribeDraft: (() => void) | null = null;
   private errorOverride: string | null = null;
+  private transcriptionMessageOverride: string | null = null;
   private elapsedTimer: ReturnType<typeof setInterval> | null = null;
   private recordingStartedAt: number | null = null;
 
@@ -87,7 +88,7 @@ export class ComposerVoiceInput {
     }
     this.controller = new VoiceInputController({
       recorder: options.recorder,
-      getTranscriber: options.getTranscriber,
+      getTranscriber: () => this.wrapTranscriber(options.getTranscriber()),
       requestPermission: () => this.requestPermission(),
       configureRecording: async () => undefined,
       releaseRecording: async () => releaseVoiceRecorder(options.recorder),
@@ -118,6 +119,7 @@ export class ComposerVoiceInput {
     }
 
     this.errorOverride = null;
+    this.transcriptionMessageOverride = null;
     if (!this.options.getTranscriber()) {
       this.publish({
         phase: "error",
@@ -134,6 +136,7 @@ export class ComposerVoiceInput {
 
   cancel(): void {
     this.errorOverride = null;
+    this.transcriptionMessageOverride = null;
     this.controller.cancel();
     if (this.controller.currentState.phase === "idle" && this.snapshot.phase !== "idle") {
       this.stopElapsedClock();
@@ -178,6 +181,28 @@ export class ComposerVoiceInput {
     return { granted: true, canAskAgain: true };
   }
 
+  private wrapTranscriber(transcriber: VoiceTranscriber | null): VoiceTranscriber | null {
+    if (!transcriber) return null;
+    return {
+      prepare: async (prepareOptions) => {
+        const prepared = await transcriber.prepare(prepareOptions);
+        return {
+          locale: prepared.locale,
+          transcribe: async (uri, transcribeOptions) => {
+            try {
+              return await prepared.transcribe(uri, transcribeOptions);
+            } catch (error) {
+              if (error instanceof VoiceTranscriptionError && error.code === "unavailable") {
+                this.transcriptionMessageOverride = error.message;
+              }
+              throw error;
+            }
+          },
+        };
+      },
+    };
+  }
+
   private handleStateChange(state: VoiceInputState): void {
     const previousPhase = this.snapshot.phase;
     let elapsedSeconds = this.snapshot.elapsedSeconds;
@@ -193,8 +218,13 @@ export class ComposerVoiceInput {
 
     if (!voiceInputBlocksSubmission(state)) this.unsubscribeFromDraft();
     const error =
-      state.phase === "error" && this.errorOverride !== null ? this.errorOverride : state.error;
-    if (state.phase !== "error") this.errorOverride = null;
+      state.phase === "error"
+        ? (this.errorOverride ?? this.transcriptionMessageOverride ?? state.error)
+        : state.error;
+    if (state.phase !== "error") {
+      this.errorOverride = null;
+      this.transcriptionMessageOverride = null;
+    }
     this.publish({ ...state, error, elapsedSeconds });
   }
 
@@ -258,8 +288,7 @@ export function useVoiceInput(options: VoiceInputOptions) {
     return createVoiceInputSession({
       recorder,
       getOwnerKey: () => latest.current.ownerKey,
-      getTranscriber: () =>
-        latest.current.getTranscriber ? latest.current.getTranscriber() : getVoiceTranscriber(),
+      getTranscriber: () => latest.current.getTranscriber(),
       readText: () => latest.current.readText(),
       readSelection: () => latest.current.readSelection(),
       commitText: (text, selection) => latest.current.commitText(text, selection),

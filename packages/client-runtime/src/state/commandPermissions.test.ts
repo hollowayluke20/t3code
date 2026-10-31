@@ -96,6 +96,23 @@ describe("command permissions", () => {
     ),
   );
 
+  it.effect("requires orchestration operate permission to transcribe voice audio", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const transcribe = createCommandPermissions(runtime, WS_METHODS.voiceTranscribe);
+        registry.set(sessions(env), AsyncResult.success(grant(false)));
+        expect(registry.get(transcribe.permissionAtom(env))).toBe(false);
+        expect((yield* transcribe.authorize(registry, env).pipe(Effect.flip)).requiredScope).toBe(
+          AuthOrchestrationOperateScope,
+        );
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(transcribe.permissionAtom(env))).toBe(true);
+        yield* transcribe.authorize(registry, env);
+      }),
+    ),
+  );
+
   it.effect("requires the destination settings grant to run storage cleanup", () =>
     Effect.scoped(
       Effect.gen(function* () {
