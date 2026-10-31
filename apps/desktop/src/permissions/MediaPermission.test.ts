@@ -87,7 +87,7 @@ describe("isAllowedMicrophonePermission", () => {
     ).toBe(false);
   });
 
-  it("denies non-media permissions even from the app origin", () => {
+  it("leaves non-media permissions unchanged (allowed)", () => {
     for (const permission of [
       "notifications",
       "geolocation",
@@ -97,7 +97,7 @@ describe("isAllowedMicrophonePermission", () => {
       "unknown",
     ]) {
       expect(isAllowedMicrophonePermission("t3code://app", permission, ["audio"], appOrigins)).toBe(
-        false,
+        true,
       );
     }
   });
@@ -178,7 +178,7 @@ describe("media permission handlers", () => {
     ).toBe(false);
   });
 
-  it("denies non-media permissions through both handlers", () => {
+  it("leaves non-media permissions unchanged (allowed) through both handlers", () => {
     const { setPermissionRequestHandler, setPermissionCheckHandler } = install({});
 
     const requestHandler = requestHandlerOf(setPermissionRequestHandler);
@@ -188,13 +188,13 @@ describe("media permission handlers", () => {
         requestingUrl: "t3code://app/",
         isMainFrame: true,
       });
-      expect(granted).toBe(false);
+      expect(granted).toBe(true);
       expect(
         checkHandlerOf(setPermissionCheckHandler)(null, permission, "t3code://app", {
           requestingUrl: "t3code://app/",
           isMainFrame: true,
         }),
-      ).toBe(false);
+      ).toBe(true);
     }
   });
 

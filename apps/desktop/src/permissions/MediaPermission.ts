@@ -47,7 +47,7 @@ export function isAllowedMicrophonePermission(
   mediaTypes: readonly string[] | undefined,
   appOrigins: readonly string[],
 ): boolean {
-  if (permission !== "media") return false;
+  if (permission !== "media") return true;
   const types = mediaTypes ?? [];
   if (!types.includes("audio") || types.includes("video")) return false;
   const requestOrigin = normalizePermissionOrigin(origin);
@@ -60,6 +60,10 @@ function installPermissionRequestHandler(
   options: MediaPermissionOptions,
 ): void {
   session.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+    if (permission !== "media") {
+      callback(true);
+      return;
+    }
     const mediaTypes = "mediaTypes" in details ? details.mediaTypes : undefined;
     const origin = firstUsableOrigin(
       "securityOrigin" in details ? details.securityOrigin : undefined,
@@ -94,6 +98,9 @@ function installPermissionCheckHandler(
   options: MediaPermissionOptions,
 ): void {
   session.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) => {
+    if (permission !== "media") {
+      return true;
+    }
     const mediaTypes = details.mediaType === undefined ? undefined : [details.mediaType];
     const origin = firstUsableOrigin(
       details.securityOrigin,
