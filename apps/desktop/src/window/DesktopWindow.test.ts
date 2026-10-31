@@ -31,6 +31,10 @@ vi.mock("electron", async (importOriginal) => ({
       },
     ]),
   },
+  systemPreferences: {
+    askForMediaAccess: vi.fn(() => Promise.resolve(true)),
+    getMediaAccessStatus: vi.fn(() => "granted"),
+  },
 }));
 
 import * as DesktopAssets from "../app/DesktopAssets.ts";
@@ -66,8 +70,13 @@ const environmentInput = {
 function makeFakeBrowserWindow() {
   const windowListeners = new Map<string, (...args: readonly unknown[]) => void>();
   const webContentsListeners = new Map<string, (...args: readonly unknown[]) => void>();
+  const session = {
+    setPermissionCheckHandler: vi.fn(),
+    setPermissionRequestHandler: vi.fn(),
+  };
   let zoomLevel = 0;
   const webContents = {
+    session,
     copyImageAt: vi.fn(),
     focus: vi.fn(),
     isDestroyed: vi.fn(() => false),
@@ -150,6 +159,8 @@ function makeFakeBrowserWindow() {
     setAutoHideCursor: window.setAutoHideCursor,
     setFullScreen: window.setFullScreen,
     setOpacity: window.setOpacity,
+    setPermissionCheckHandler: session.setPermissionCheckHandler,
+    setPermissionRequestHandler: session.setPermissionRequestHandler,
     webContentsListeners,
     webContentsOnce: webContents.once,
     windowListeners,
@@ -590,6 +601,48 @@ describe("DesktopWindow", () => {
         prevented = false;
         beforeInput(event, { ...input, meta: false });
         assert.isFalse(prevented);
+      }).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("allows microphone access only from the window's own origin", () =>
+    Effect.gen(function* () {
+      const fakeWindow = makeFakeBrowserWindow();
+      const createCount = yield* Ref.make(0);
+      const mainWindow = yield* Ref.make<Option.Option<Electron.BrowserWindow>>(Option.none());
+      const layer = layerTest({ window: fakeWindow.window, createCount, mainWindow });
+
+      yield* Effect.gen(function* () {
+        const desktopWindow = yield* DesktopWindow.DesktopWindow;
+        yield* desktopWindow.handleBackendReady(new URL("http://127.0.0.1:3773"));
+
+        const requestHandler = fakeWindow.setPermissionRequestHandler.mock.calls[0]?.[0];
+        const checkHandler = fakeWindow.setPermissionCheckHandler.mock.calls[0]?.[0];
+        assert.isFunction(requestHandler);
+        assert.isFunction(checkHandler);
+
+        const request = (details: object) => {
+          let granted: boolean | undefined;
+          requestHandler(null, "media", (value: boolean) => (granted = value), details);
+          return granted;
+        };
+        assert.isTrue(
+          request({ requestingUrl: "t3code-dev://app/threads/1", mediaTypes: ["audio"] }),
+        );
+        assert.isFalse(request({ requestingUrl: "https://evil.example/", mediaTypes: ["audio"] }));
+        assert.isFalse(request({ requestingUrl: "t3code-dev://app/", mediaTypes: ["video"] }));
+        assert.isTrue(
+          checkHandler(null, "media", "t3code-dev://app", {
+            mediaType: "audio",
+            requestingUrl: "t3code-dev://app/threads/1",
+          }),
+        );
+        assert.isFalse(
+          checkHandler(null, "media", "https://evil.example", {
+            mediaType: "audio",
+            requestingUrl: "https://evil.example/",
+          }),
+        );
       }).pipe(Effect.provide(layer));
     }),
   );
