@@ -11,6 +11,7 @@ import {
 } from "@t3tools/client-runtime/voice-input";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { useStableCallback } from "../hooks/useStableCallback";
 import {
   BrowserVoiceRecorder,
   createBrowserVoiceRecorder,
@@ -278,24 +279,27 @@ export function createVoiceInputSession(options: VoiceInputSessionOptions): Comp
 }
 
 export function useVoiceInput(options: VoiceInputOptions) {
-  const latest = useRef(options);
-  // oxlint-disable-next-line react/refs -- async recording callbacks read the composer's current draft adapter
-  latest.current = options;
+  const getOwnerKey = useStableCallback(() => options.ownerKey);
+  const getTranscriber = useStableCallback(options.getTranscriber);
+  const readText = useStableCallback(options.readText);
+  const readSelection = useStableCallback(options.readSelection);
+  const commitText = useStableCallback(options.commitText);
+  const subscribeToDraftChanges = useStableCallback(options.subscribeToDraftChanges);
+  const requestPermission = useStableCallback(
+    options.requestPermission ?? (async () => ({ granted: true, canAskAgain: true })),
+  );
 
-  // oxlint-disable-next-line react/refs -- the first render captures callbacks that read the latest adapter ref
   const [session] = useState(() => {
     const recorder = options.recorder ?? createBrowserVoiceRecorder();
     return createVoiceInputSession({
       recorder,
-      getOwnerKey: () => latest.current.ownerKey,
-      getTranscriber: () => latest.current.getTranscriber(),
-      readText: () => latest.current.readText(),
-      readSelection: () => latest.current.readSelection(),
-      commitText: (text, selection) => latest.current.commitText(text, selection),
-      subscribeToDraftChanges: (listener) => latest.current.subscribeToDraftChanges(listener),
-      ...(options.requestPermission
-        ? { requestPermission: () => latest.current.requestPermission!() }
-        : {}),
+      getOwnerKey,
+      getTranscriber,
+      readText,
+      readSelection,
+      commitText,
+      subscribeToDraftChanges,
+      ...(options.requestPermission ? { requestPermission } : {}),
     });
   });
 
