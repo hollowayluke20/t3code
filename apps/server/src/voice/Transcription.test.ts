@@ -51,6 +51,24 @@ const writeFakeWhisper = (directory: string) =>
     yield* fileSystem.writeFileString(path.join(directory, "ggml-model.bin"), "fake model");
   });
 
+const writeDefaultVoiceFolder = (
+  home: string,
+  modelNames: ReadonlyArray<string> = ["ggml-small.en.bin"],
+) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const binDirectory = path.join(home, ".t3-voice", "bin");
+    const modelsDirectory = path.join(home, ".t3-voice", "models");
+    yield* fileSystem.makeDirectory(binDirectory, { recursive: true });
+    yield* fileSystem.makeDirectory(modelsDirectory, { recursive: true });
+    yield* fileSystem.writeFileString(path.join(binDirectory, "whisper-cli"), FAKE_WHISPER_SCRIPT);
+    yield* fileSystem.chmod(path.join(binDirectory, "whisper-cli"), 0o755);
+    for (const modelName of modelNames) {
+      yield* fileSystem.writeFileString(path.join(modelsDirectory, modelName), "fake model");
+    }
+  });
+
 const fakeEnvironment = (directory: string): NodeJS.ProcessEnv => ({
   PATH: "",
   T3CODE_WHISPER_BIN: `${directory}/whisper-cli`,
@@ -74,11 +92,19 @@ const withFakeWhisper = <A, E>(
     yield* writeFakeWhisper(directory);
     return yield* body(directory).pipe(
       Effect.provideService(HostProcess.Environment, environment(directory)),
+      Effect.provideService(HostProcess.HomeDirectory, directory),
     );
   }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped);
 
 const withEnvironment = <A, E, R>(effect: Effect.Effect<A, E, R>, environment: NodeJS.ProcessEnv) =>
-  effect.pipe(Effect.provideService(HostProcess.Environment, environment));
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-voice-home-" });
+    return yield* effect.pipe(
+      Effect.provideService(HostProcess.Environment, environment),
+      Effect.provideService(HostProcess.HomeDirectory, home),
+    );
+  }).pipe(Effect.scoped);
 
 describe("Transcription", () => {
   it.live("runs the configured whisper binary and removes its temporary files", () =>
@@ -114,7 +140,7 @@ describe("Transcription", () => {
         expect(error.reason).toBe("invalid-audio");
       }),
       {},
-    ).pipe(Effect.provide(layerTranscriptionLive)),
+    ).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
   it.live("rejects a payload that is not base64 as invalid audio", () =>
@@ -126,7 +152,7 @@ describe("Transcription", () => {
         expect(error.reason).toBe("invalid-audio");
       }),
       {},
-    ).pipe(Effect.provide(layerTranscriptionLive)),
+    ).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
   it.live("rejects non-WAV audio when ffmpeg is unavailable", () =>
@@ -140,7 +166,7 @@ describe("Transcription", () => {
         expect(error.message).toContain("ffmpeg");
       }),
       { PATH: "" },
-    ).pipe(Effect.provide(layerTranscriptionLive)),
+    ).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
   it.live("rejects audio larger than the 20 MB limit", () =>
@@ -154,7 +180,7 @@ describe("Transcription", () => {
         expect(error.reason).toBe("too-large");
       }),
       {},
-    ).pipe(Effect.provide(layerTranscriptionLive)),
+    ).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
   it.live("reports unavailable when no whisper model is configured", () =>
@@ -168,7 +194,7 @@ describe("Transcription", () => {
         expect(error.message).toContain("T3CODE_WHISPER_MODEL");
       }),
       { PATH: "" },
-    ).pipe(Effect.provide(layerTranscriptionLive)),
+    ).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
   it.live("reports unavailable when no whisper binary is configured or on PATH", () =>
@@ -189,10 +215,90 @@ describe("Transcription", () => {
           PATH: "",
           T3CODE_WHISPER_MODEL: model,
         }),
+        Effect.provideService(HostProcess.HomeDirectory, directory),
         Effect.flip,
       );
       expect(error.reason).toBe("unavailable");
       expect(error.message).toContain("T3CODE_WHISPER_BIN");
+    }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
+  );
+
+  it.live("finds whisper and the model in the default voice folder under home", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-voice-home-" });
+      yield* writeDefaultVoiceFolder(home);
+
+      const result = yield* transcribe({
+        audioBase64: Base64.encode(FAKE_WAV),
+        mimeType: "audio/wav",
+      }).pipe(
+        Effect.provideService(HostProcess.Environment, { PATH: "" }),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
+
+      expect(result.text).toBe("fake text");
+      expect(result.model).toBe("ggml-small.en.bin");
+    }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
+  );
+
+  it.live("prefers a large-v3-turbo default model over other sizes", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-voice-home-" });
+      yield* writeDefaultVoiceFolder(home, [
+        "ggml-medium.en.bin",
+        "ggml-small.en.bin",
+        "ggml-large-v3-turbo-q5_0.bin",
+      ]);
+
+      const result = yield* transcribe({
+        audioBase64: Base64.encode(FAKE_WAV),
+        mimeType: "audio/wav",
+      }).pipe(
+        Effect.provideService(HostProcess.Environment, { PATH: "" }),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
+
+      expect(result.model).toBe("ggml-large-v3-turbo-q5_0.bin");
+    }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
+  );
+
+  it.live("prefers a small default model when no large-v3-turbo model exists", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-voice-home-" });
+      yield* writeDefaultVoiceFolder(home, ["ggml-medium.en.bin", "ggml-small.en.bin"]);
+
+      const result = yield* transcribe({
+        audioBase64: Base64.encode(FAKE_WAV),
+        mimeType: "audio/wav",
+      }).pipe(
+        Effect.provideService(HostProcess.Environment, { PATH: "" }),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+      );
+
+      expect(result.model).toBe("ggml-small.en.bin");
+    }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
+  );
+
+  it.live("names the default model folder when no model is available", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const home = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-voice-home-" });
+
+      const error = yield* transcribe({
+        audioBase64: Base64.encode(FAKE_WAV),
+        mimeType: "audio/wav",
+      }).pipe(
+        Effect.provideService(HostProcess.Environment, { PATH: "" }),
+        Effect.provideService(HostProcess.HomeDirectory, home),
+        Effect.flip,
+      );
+
+      expect(error.reason).toBe("unavailable");
+      expect(error.message).toContain(path.join(home, ".t3-voice", "models"));
     }).pipe(Effect.provide(layerTranscriptionLive), Effect.scoped),
   );
 
