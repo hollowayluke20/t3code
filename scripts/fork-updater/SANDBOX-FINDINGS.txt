@@ -1,0 +1,60 @@
+Fork updater sandbox install test - 2026-10-31
+==============================================
+
+Host: Luke's Mac mini (darwin arm64). Updater: ~/.t3/bin/t3 (t3 v0.1.6).
+Archive under test (built by slice U1): v0.1.6-luke.1
+  t3-0.1.6-luke.1-darwin-arm64.tar.gz (105 MiB, sha256 6a763ecf...6fd35f8)
+Sandbox home: mktemp -d, no service installed, ports 3791 (release server) / 3792 (t3 serve).
+Harness: scripts/fork-updater/sandbox-install-test.sh
+
+Result: PASS. Installed binary reports "t3 v0.1.6-luke.1"; serve on
+127.0.0.1:3792 returned HTTP 200 and the served client asset _chat-qj919hwJ.js
+contains "Dictate". Both processes were stopped by tracked PID; port 3792 closed.
+
+Version string scheme
+---------------------
+"0.1.6-luke.1" works end to end: release dir v0.1.6-luke.1, archive name
+t3-0.1.6-luke.1-darwin-arm64.tar.gz, installed binary reports v0.1.6-luke.1,
+and the updater's exact-version + --version validation accepted it.
+A "+luke.1" build was not produced by U1, so '+' remains untested end to end.
+isExactServiceVersion accepts build metadata and compareExactServiceVersions
+ignores it, so "0.1.6+luke.1" should avoid the downgrade guard, but the archive
+name and URL would contain a literal '+' (no URL-encoding issue expected in a
+path; untested).
+
+--allow-downgrade
+-----------------
+REQUIRED for the "-" scheme. A prerelease sorts below its release, so 0.1.6-luke.1
+< 0.1.6. Without the flag, against the same temp home:
+
+  ERROR (#2): CliUpdateError: t3@0.1.6-luke.1 is older than the installed 0.1.6.
+  Pass --allow-downgrade to install it anyway.   (exit 1, no download attempted)
+
+The harness always passes --allow-downgrade.
+
+Timings (measured by the harness)
+---------------------------------
+release server ready:       <1 s
+t3 update (download+verify+extract+validate): 10 s
+serve ready and GET / -> 200: 1 s
+total script run:           19 s
+
+Surprises / notes
+-----------------
+1. ~/.t3/bin/t3 is NOT the pinned runtime. It is a 572-byte shell shim:
+   ELECTRON_RUN_AS_NODE=1 exec "T3 Code (Beta).app/.../bin.mjs" "$@".
+   ~/.local/bin/t3 is the symlink to ~/.t3/runtime/versions/0.1.6/t3.
+   Running update through the shim still installed the archive into --base-dir.
+2. The updater noticed the live service on ~/.t3 and printed
+   "The background service serves /Users/adminaccount/.t3 and was left unchanged."
+   It did not restart or repoint anything outside the temp home. Good cross-home safety.
+3. serve flag is --base-dir (not --home-dir) in 0.1.6; use
+   --base-dir <tmp> --port 3792 --host 127.0.0.1 --no-browser for a loopback-only run.
+4. The served index title is "T3 Code (Beta)"; the fork marker lives in a lazy
+   chat chunk, not index.html, so grep the built client/assets or fetch that chunk.
+5. No '+', no spaces, no URL-encoding issues with this version.
+
+Reproduce
+---------
+scripts/fork-updater/sandbox-install-test.sh --releases-dir ~/Development/t3code-fork-releases/test-u1
+  [--version 0.1.6-luke.1] [--keep-home]
