@@ -122,6 +122,15 @@ VP="$REPO_DIR/node_modules/.bin/vp"
 [ -x "$VP" ] || fail "missing $VP; run the worktree setup or install dependencies"
 export PATH="$REPO_DIR/node_modules/.bin:$PATH"
 
+# Bake the public T3 Connect settings into the build (shell values win if already set).
+PUBLIC_CONFIG_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/public-config.env"
+if [ -f "$PUBLIC_CONFIG_FILE" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in ''|\#*) continue ;; esac
+    if [ -z "${!key:-}" ]; then export "$key=$value"; fi
+  done <"$PUBLIC_CONFIG_FILE"
+fi
+
 command -v node >/dev/null 2>&1 || fail "node is not on PATH"
 
 HOST_NODE_VERSION=$(node -p 'process.versions.node')
