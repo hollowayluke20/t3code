@@ -213,6 +213,14 @@ function summarizeLine(line) {
   return line.trim().slice(0, MAX_FAILURE_LINE_LENGTH);
 }
 
+export function firstLines(text, count = 3) {
+  const lines = String(text ?? "")
+    .split(/\r?\n/)
+    .map(summarizeLine)
+    .filter((line) => line !== "");
+  return lines.slice(0, count);
+}
+
 export function summarizeFailure(output) {
   const lines = String(output ?? "")
     .split(/\r?\n/)
@@ -1065,15 +1073,15 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
   }
 
   await logger.step("health check: transcription");
-  const transcription = await env.run(config.t3Bin, ["voice", "transcribe", config.testWav], {
+  const binary = path.join(config.t3Home, "runtime", "versions", version, "t3");
+  const transcription = await env.run(binary, ["voice", "transcribe", config.testWav], {
     timeoutMs: HEALTH_TIMEOUT_MS,
   });
   const transcriptionOutput = combineOutput(transcription);
   if ((transcription.status ?? 0) !== 0 || !/hello/i.test(transcriptionOutput)) {
-    throw new HealthFailure(
-      "transcription check failed",
-      summarizeFailure(transcriptionOutput).join(" | ") || "no output",
-    );
+    const stderrLines = firstLines(transcription.stderr, 3);
+    const detailLines = stderrLines.length > 0 ? stderrLines : firstLines(transcriptionOutput, 3);
+    throw new HealthFailure("transcription check failed", detailLines.join(" | ") || "no output");
   }
   await logger.info(`health check passed for ${version}`);
 }

@@ -304,14 +304,28 @@ function makeRunner(configuration, options = {}) {
         return ok("thread-1\n");
       }
       if (args[0] === "voice" && args[1] === "transcribe") {
-        if (flags.transcriptionFails) return ok("unintelligible speech\n");
-        return ok("hello from the mac mini\n");
+        return failed("Usage: t3 <command> [options]\n\nCommands:\n  update [version]\n");
       }
       if (args[0] === "--version") return ok(`t3 v${flags.installed}\n`);
     }
     if (command.includes("/runtime/versions/") && command.endsWith("/t3")) {
       if (args[0] === "--version") return ok(`t3 v${flags.installed}\n`);
       if (args[0] === "serve") return { ...ok(), pid: 5000 };
+      if (args[0] === "voice" && args[1] === "transcribe") {
+        if (flags.transcriptionFails) {
+          return failed(
+            [
+              "Usage: t3 <command> [options]",
+              "",
+              "Commands:",
+              "  update [version]",
+              "  service status|restart",
+              "  thread list|start",
+            ].join("\n"),
+          );
+        }
+        return ok("hello from the mac mini\n");
+      }
     }
     return ok();
   };
@@ -584,7 +598,7 @@ test("a focused test failure names the failing path and shows the test summary",
   assert.match(harness.readLog(), /TypeError/);
 });
 
-test("a transcription failure notifies with a short title and detail in the body", async () => {
+test("a transcription failure notifies with a short title and the first stderr lines", async () => {
   const harness = createReleaseHarness({ transcriptionFails: true });
   const result = await main(["run-now", "--force"], harness.env);
   assert.equal(result.result, "rolled-back");
@@ -593,8 +607,31 @@ test("a transcription failure notifies with a short title and detail in the body
     "T3 update FAILED: transcription check failed, still on 0.1.6-luke.1",
   );
   const body = harness.notifications[0].message;
-  assert.match(body, /unintelligible speech/);
+  assert.match(body, /Usage: t3 <command> \[options\] \| Commands: \| update \[version\]/);
+  assert.doesNotMatch(body, /service status\|restart/);
+  assert.doesNotMatch(body, /thread list\|start/);
   assert.match(body, /Rolled back to 0\.1\.6-luke\.1/);
+});
+
+test("the transcription check runs the version binary, not the launcher", async () => {
+  const harness = createReleaseHarness();
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const transcriptions = harness.calls.filter(
+    ({ args }) => args[0] === "voice" && args[1] === "transcribe",
+  );
+  assert.equal(transcriptions.length, 1);
+  assert.equal(
+    transcriptions[0].command,
+    path.join(harness.config.t3Home, "runtime", "versions", NEW_VERSION, "t3"),
+  );
+  assert.deepEqual(transcriptions[0].args, ["voice", "transcribe", harness.config.testWav]);
+  assert.equal(
+    harness.calls.some(
+      ({ command, args }) => command === harness.config.t3Bin && args[0] === "voice",
+    ),
+    false,
+  );
 });
 
 test("a down service is restarted once and then reported", async () => {
@@ -731,6 +768,12 @@ test("sandbox mode updates with --base-dir and restarts the sandbox server", asy
     harness.calls.some(({ command, args }) => command === "kill" && args[0] === "4242"),
     true,
   );
+  const transcription = harness.calls.find(
+    ({ args }) => args[0] === "voice" && args[1] === "transcribe",
+  );
+  assert.notEqual(transcription, undefined);
+  assert.equal(transcription.command, `${BASE}/sandbox-t3home/runtime/versions/${NEW_VERSION}/t3`);
+  assert.deepEqual(transcription.args, ["voice", "transcribe", harness.config.testWav]);
   assert.equal(harness.readState().current, NEW_VERSION);
 });
 
