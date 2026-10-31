@@ -19,6 +19,19 @@ const PROJECTS_QUERY =
   "select project_id as id, title, workspace_root as workspaceRoot from projection_projects";
 const BUSY_THREAD_STATUSES = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 const HISTORY_LIMIT = 50;
+const FOCUSED_TEST_STEP = "focused voice, permission, and contract tests";
+const FOCUSED_TEST_PATHS = [
+  "apps/server/src/voice",
+  "apps/web/src/voice",
+  "apps/desktop/src/permissions",
+  "packages/contracts",
+];
+const FAILURE_LINE_PATTERN =
+  /(?:\b(?:FAIL|FAILED|Error|AssertionError|TypeError|error TS\d+)\b|✗|×)/;
+const TEST_SUMMARY_PATTERN = /^(?:Test Files|Tests)\b/;
+const MAX_FAILURE_SUMMARY_LINES = 6;
+const MAX_FAILURE_LINE_LENGTH = 160;
+const MAX_SHORT_REASON_LENGTH = 70;
 
 const DEFAULTS = {
   forkUpdaterHome: "~/.t3-fork-updater",
@@ -196,10 +209,105 @@ export function lastLines(text, count = 5) {
   return lines.slice(-count);
 }
 
+function summarizeLine(line) {
+  return line.trim().slice(0, MAX_FAILURE_LINE_LENGTH);
+}
+
+export function summarizeFailure(output) {
+  const lines = String(output ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+
+  const summaryLines = [];
+  let testFiles = null;
+  let tests = null;
+  for (const line of lines) {
+    if (!TEST_SUMMARY_PATTERN.test(line)) continue;
+    if (/^Test Files\b/.test(line)) testFiles = summarizeLine(line);
+    else tests = summarizeLine(line);
+  }
+  if (testFiles) summaryLines.push(testFiles);
+  if (tests && tests !== testFiles) summaryLines.push(tests);
+
+  const seen = new Set(summaryLines);
+  const matches = [];
+  for (const line of lines) {
+    if (!FAILURE_LINE_PATTERN.test(line)) continue;
+    const candidate = summarizeLine(line);
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    matches.push(candidate);
+  }
+
+  const room = Math.max(0, MAX_FAILURE_SUMMARY_LINES - summaryLines.length);
+  const selected = matches.slice(0, room);
+  if (selected.length + summaryLines.length > 0) return [...selected, ...summaryLines];
+  return lines.slice(-5).map(summarizeLine);
+}
+
 function oneLine(text) {
   return String(text ?? "")
     .replace(/\s*\n+\s*/g, " ")
     .trim();
+}
+
+function shortFailureReason(text) {
+  const flat = oneLine(text);
+  if (flat.length <= MAX_SHORT_REASON_LENGTH) return flat;
+  return `${flat.slice(0, MAX_SHORT_REASON_LENGTH - 1).trimEnd()}…`;
+}
+
+function failureTitle(reason, oldVersion) {
+  return `T3 update FAILED: ${shortFailureReason(reason)}, still on ${oldVersion}`;
+}
+
+function recoveryInstructions() {
+  return [
+    "Retry: node scripts/fork-updater/fork-updater.mjs run-now",
+    "Roll back: node scripts/fork-updater/fork-updater.mjs rollback",
+    "Reply to acknowledge in one short line.",
+  ];
+}
+
+function failedTestPath(output) {
+  const lines = String(output ?? "").split(/\r?\n/);
+  for (const candidate of FOCUSED_TEST_PATHS) {
+    if (lines.some((line) => line.includes("FAIL") && line.includes(candidate))) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function describeStepFailure(step, output) {
+  if (step.startsWith("typecheck ")) {
+    const packageName = step.slice("typecheck ".length);
+    return { reason: `${step} failed`, shortReason: `typecheck failed (${packageName})` };
+  }
+  if (step === FOCUSED_TEST_STEP) {
+    const failedPath = failedTestPath(output);
+    return {
+      reason: `${step} failed`,
+      shortReason: failedPath ? `tests failed (${failedPath})` : "tests failed",
+    };
+  }
+  if (step.startsWith("building release archive")) {
+    return { reason: `${step} failed`, shortReason: "build failed" };
+  }
+  if (step.startsWith("t3 update")) {
+    return { reason: `${step} failed`, shortReason: "install failed" };
+  }
+  if (step.startsWith("installing dependencies")) {
+    return { reason: `${step} failed`, shortReason: "dependency install failed" };
+  }
+  if (step.startsWith("locate the build vp")) {
+    return { reason: `${step} failed`, shortReason: "build vp missing after install" };
+  }
+  if (step === "release server") {
+    return { reason: `${step} failed`, shortReason: "release server failed" };
+  }
+  return { reason: `${step} failed`, shortReason: `${step} failed` };
 }
 
 async function bestEffort(logger, label, action) {
@@ -231,9 +339,11 @@ class MergeConflict extends Error {
 }
 
 class HealthFailure extends Error {
-  constructor(reason) {
-    super(reason);
+  constructor(reason, detail = "") {
+    super(detail ? `${reason}: ${detail}` : reason);
     this.name = "HealthFailure";
+    this.reason = reason;
+    this.detail = detail;
   }
 }
 
@@ -454,21 +564,32 @@ async function prepareBuild(env, logger, tag) {
   return directory;
 }
 
-async function findVp(env, buildDirectory) {
-  const candidates = [path.join(buildDirectory, "node_modules", ".bin", "vp"), env.config.toolsVp];
-  for (const candidate of candidates) {
-    if (await env.fs.exists(candidate)) return candidate;
-  }
+async function findToolsVp(env) {
+  if (await env.fs.exists(env.config.toolsVp)) return env.config.toolsVp;
   return "vp";
 }
 
+async function findBuildVp(env, buildDirectory) {
+  const vp = path.join(buildDirectory, "node_modules", ".bin", "vp");
+  if (await env.fs.exists(vp)) return vp;
+  return null;
+}
+
 async function runGates(env, logger, buildDirectory) {
-  const vp = await findVp(env, buildDirectory);
-  await logger.info(`using vp at ${vp}`);
-  await runChecked(env, logger, "installing dependencies (vp i)", vp, ["i"], {
+  const installVp = await findToolsVp(env);
+  await logger.info(`installing dependencies with ${installVp}`);
+  await runChecked(env, logger, "installing dependencies (vp i)", installVp, ["i"], {
     cwd: buildDirectory,
     timeoutMs: 30 * 60_000,
   });
+  const vp = await findBuildVp(env, buildDirectory);
+  if (vp === null) {
+    throw new StepFailure(
+      "locate the build vp after install",
+      `missing ${path.join(buildDirectory, "node_modules", ".bin", "vp")}`,
+    );
+  }
+  await logger.info(`using build vp at ${vp}`);
   for (const packageName of ["@t3tools/contracts", "t3", "@t3tools/web", "@t3tools/desktop"]) {
     await runChecked(
       env,
@@ -482,7 +603,7 @@ async function runGates(env, logger, buildDirectory) {
   await runChecked(
     env,
     logger,
-    "focused voice, permission, and contract tests",
+    FOCUSED_TEST_STEP,
     vp,
     [
       "test",
@@ -848,7 +969,7 @@ async function restartSandboxServer(env, logger, version) {
   await env.fs.writeFile(path.join(env.config.home, "sandbox.pid"), `${started.pid}\n`);
 }
 
-async function waitUntil(env, label, timeoutMs, attempt) {
+async function waitUntil(env, reason, timeoutMs, attempt) {
   const deadline = env.now().getTime() + timeoutMs;
   let detail = "";
   while (true) {
@@ -856,7 +977,7 @@ async function waitUntil(env, label, timeoutMs, attempt) {
     if (result.ok) return result.value;
     detail = result.detail ?? detail;
     if (env.now().getTime() >= deadline) {
-      throw new HealthFailure(`${label} failed${detail ? `: ${detail}` : ""}`);
+      throw new HealthFailure(reason, detail);
     }
     await env.sleep(2_000);
   }
@@ -866,24 +987,34 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
   const config = env.config;
   const origin = `http://127.0.0.1:${config.servicePort}/`;
   await logger.step(`health check: GET ${origin}`);
-  await waitUntil(env, `HTTP check on ${origin}`, HEALTH_TIMEOUT_MS, async () => {
-    const response = await env.httpGet(origin, { timeoutMs: 3_000 });
-    return {
-      ok: response.status === 200,
-      value: response.status,
-      detail: `GET / returned ${response.status || "no response"}`,
-    };
-  });
+  await waitUntil(
+    env,
+    "health check failed (service did not answer)",
+    HEALTH_TIMEOUT_MS,
+    async () => {
+      const response = await env.httpGet(origin, { timeoutMs: 3_000 });
+      return {
+        ok: response.status === 200,
+        value: response.status,
+        detail: `GET / returned ${response.status || "no response"}`,
+      };
+    },
+  );
 
   await logger.step("health check: running version");
-  await waitUntil(env, "running version check", HEALTH_TIMEOUT_MS, async () => {
-    const running = await getRunningVersion(env, version);
-    return {
-      ok: running === version,
-      value: running,
-      detail: `running ${running ?? "an unknown version"}, wanted ${version}`,
-    };
-  });
+  await waitUntil(
+    env,
+    "health check failed (wrong version running)",
+    HEALTH_TIMEOUT_MS,
+    async () => {
+      const running = await getRunningVersion(env, version);
+      return {
+        ok: running === version,
+        value: running,
+        detail: `running ${running ?? "an unknown version"}, wanted ${version}`,
+      };
+    },
+  );
 
   if (!featureChecks) {
     await logger.info(`health check passed for ${version} (feature checks skipped)`);
@@ -914,7 +1045,10 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
     );
     const output = combineOutput(thread);
     if ((thread.status ?? 0) !== 0) {
-      throw new HealthFailure(`OK thread failed: ${oneLine(lastLines(output, 3).join(" | "))}`);
+      throw new HealthFailure(
+        "health check failed (OK thread failed)",
+        summarizeFailure(output).join(" | ") || "no output",
+      );
     }
     let reply = thread.stdout ?? "";
     try {
@@ -923,7 +1057,10 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
       // Plain text output is fine too.
     }
     if (!/ok/i.test(reply)) {
-      throw new HealthFailure(`OK thread replied '${oneLine(reply).slice(0, 160) || "(nothing)"}'`);
+      throw new HealthFailure(
+        "health check failed (OK thread replied wrong)",
+        oneLine(reply).slice(0, 160) || "(nothing)",
+      );
     }
   }
 
@@ -934,35 +1071,74 @@ async function healthCheck(env, logger, version, { featureChecks = true } = {}) 
   const transcriptionOutput = combineOutput(transcription);
   if ((transcription.status ?? 0) !== 0 || !/hello/i.test(transcriptionOutput)) {
     throw new HealthFailure(
-      `transcription did not contain hello: ${oneLine(lastLines(transcriptionOutput, 3).join(" | ")) || "no output"}`,
+      "transcription check failed",
+      summarizeFailure(transcriptionOutput).join(" | ") || "no output",
     );
   }
   await logger.info(`health check passed for ${version}`);
 }
 
-async function noPreviousRollback(env, logger, state, reason) {
-  const message = `T3 update FAILED: ${reason}; ROLLBACK ALSO FAILED (no previous version recorded)`;
-  await logger.error(message);
-  state.lastRun = { result: "fail", message, at: env.now().toISOString() };
+async function noPreviousRollback(env, logger, state, reason, details = []) {
+  const old = state.current ?? "the previously installed version";
+  const title = failureTitle(reason, old);
+  const message = [
+    `${title}.`,
+    "",
+    "Rollback also failed: no previous version is recorded.",
+    ...(details.length > 0 ? ["", ...details] : []),
+    "",
+    `Log: ${logPath(env.config)}`,
+    "Retry: node scripts/fork-updater/fork-updater.mjs run-now",
+    "Reply to acknowledge in one short line.",
+  ].join("\n");
+  await logger.error(`${title}; rollback also failed (no previous version recorded)`);
+  state.lastRun = {
+    result: "fail",
+    message: `${reason}; rollback failed (no previous version recorded)`,
+    at: env.now().toISOString(),
+  };
   await saveState(env, state);
-  await env.notify({ kind: "fail", title: message, message });
+  await env.notify({ kind: "fail", title, message });
   return { exitCode: 1, result: "rollback-failed" };
 }
 
-async function performRollback(env, logger, state, { reason, manual, tag = null }) {
+async function performRollback(
+  env,
+  logger,
+  state,
+  { reason, shortReason, details = [], manual, tag = null },
+) {
   const target = state.previous ?? state.previousVersion ?? null;
   if (tag) state.failed = { tag, at: env.now().toISOString(), reason };
-  if (!target) return noPreviousRollback(env, logger, state, reason);
+  if (!target) return noPreviousRollback(env, logger, state, shortReason ?? reason, details);
   await logger.step(`rolling back to ${target}`);
   try {
     await installVersion(env, logger, target, { sandbox: env.config.switchMode === "sandbox" });
     await healthCheck(env, logger, target, { featureChecks: false });
   } catch (error) {
-    const message = `T3 update FAILED: ${reason}; ROLLBACK ALSO FAILED (${error.message})`;
-    await logger.error(message);
-    state.lastRun = { result: "fail", message, at: env.now().toISOString() };
+    const rollbackDetail =
+      error instanceof StepFailure
+        ? summarizeFailure(error.output).join(" | ") || oneLine(error.message)
+        : oneLine(error.message);
+    const title = failureTitle(shortReason ?? reason, target);
+    const message = [
+      `${title}.`,
+      "",
+      `Rollback to ${target} also failed: ${rollbackDetail}`,
+      ...(details.length > 0 ? ["", ...details] : []),
+      "",
+      `Log: ${logPath(env.config)}`,
+      "Retry: node scripts/fork-updater/fork-updater.mjs run-now",
+      "Reply to acknowledge in one short line.",
+    ].join("\n");
+    await logger.error(`${title}; rollback to ${target} also failed (${rollbackDetail})`);
+    state.lastRun = {
+      result: "fail",
+      message: `${reason}; rollback to ${target} failed`,
+      at: env.now().toISOString(),
+    };
     await saveState(env, state);
-    await env.notify({ kind: "fail", title: message, message });
+    await env.notify({ kind: "fail", title, message });
     return { exitCode: 1, result: "rollback-failed" };
   }
 
@@ -982,39 +1158,64 @@ async function performRollback(env, logger, state, { reason, manual, tag = null 
   await saveState(env, state);
   await logger.info(`rolled back to ${target}`);
   if (manual) {
+    const title = `T3 update: rolled back to ${target}`;
     await env.notify({
       kind: "info",
-      title: `T3 update: rolled back to ${target}`,
-      message: `T3 update: rolled back to ${target}. Reply to acknowledge in one short line.`,
+      title,
+      message: [
+        `${title}.`,
+        "",
+        `Log: ${logPath(env.config)}`,
+        "Reply to acknowledge in one short line.",
+      ].join("\n"),
     });
   } else {
+    const title = failureTitle(shortReason ?? reason, target);
     await env.notify({
       kind: "fail",
-      title: `T3 update FAILED: ${reason}, still on ${target}`,
-      message: `T3 update FAILED: ${reason}, still on ${target}. Reply to acknowledge in one short line.`,
+      title,
+      message: [
+        `${title}.`,
+        "",
+        `Rolled back to ${target}.`,
+        ...(details.length > 0 ? ["", ...details] : []),
+        "",
+        `Log: ${logPath(env.config)}`,
+        ...recoveryInstructions(),
+      ].join("\n"),
     });
   }
   return { exitCode: manual ? 0 : 1, result: "rolled-back" };
 }
 
-async function recordFailure(env, logger, state, { tag, reason, step, output, markTag, previous }) {
+async function recordFailure(
+  env,
+  logger,
+  state,
+  { tag, reason, shortReason, step, output, files = [], details, markTag, previous },
+) {
+  const summary = details ?? summarizeFailure(output);
   if (step) {
     await logger.error(`${step} failed`);
-    for (const line of lastLines(output, 5)) await logger.error(`  ${line}`);
+    for (const line of summary) await logger.error(`  ${line}`);
   }
+  if (files.length > 0) await logger.error(`conflicted files: ${files.join(", ")}`);
   if (markTag && tag) {
     state.failed = { tag, at: env.now().toISOString(), reason };
   }
   state.lastRun = { result: "fail", message: reason, at: env.now().toISOString() };
   await saveState(env, state);
   const old = previous ?? state.current ?? "the previously installed version";
-  const tail = lastLines(output, 5).join(" | ");
-  const message = `T3 update FAILED: ${reason}${tail ? ` (${tail})` : ""}, still on ${old}`;
-  await env.notify({
-    kind: "fail",
-    title: `T3 update FAILED: ${reason}, still on ${old}`,
-    message: `${message}. Reply to acknowledge in one short line.`,
-  });
+  const title = failureTitle(shortReason ?? reason, old);
+  const message = [
+    `${title}.`,
+    ...(files.length > 0 ? [`Conflicted files: ${files.join(", ")}`] : []),
+    ...(summary.length > 0 ? ["", ...summary] : []),
+    "",
+    `Log: ${logPath(env.config)}`,
+    ...recoveryInstructions(),
+  ].join("\n");
+  await env.notify({ kind: "fail", title, message });
   return { exitCode: 1, result: "fail" };
 }
 
@@ -1119,7 +1320,12 @@ async function recordSuccess(
   await env.notify({
     kind: "ok",
     title: `T3 update: ${version} installed`,
-    message: `T3 update: ${version} installed. Reply to acknowledge in one short line.`,
+    message: [
+      `T3 update: ${version} installed.`,
+      `Log: ${logPath(config)}`,
+      "Roll back: node scripts/fork-updater/fork-updater.mjs rollback",
+      "Reply to acknowledge in one short line.",
+    ].join("\n"),
   });
   await logger.info(`installed ${version}`);
   return { exitCode: 0, result: "ok" };
@@ -1174,22 +1380,44 @@ async function runPipeline(env, logger, state, { force, ignoreBackoff }) {
       );
     }
     if (error instanceof MergeConflict) {
+      const files = error.files ?? [];
+      const reason = `merge conflict in ${files.join(", ") || "unknown files"}`;
+      const shortReason =
+        files.length === 0
+          ? reason
+          : files.length === 1
+            ? reason
+            : `merge conflict in ${files[0]} (+${files.length - 1} more)`;
       return recordFailure(env, logger, state, {
         tag,
-        reason: `merge conflict in ${error.files.join(", ") || "unknown files"}`,
+        reason,
+        shortReason,
         step: "git merge",
+        output: error.output,
+        files,
+        details: [],
+        markTag: true,
+        previous: state.current,
+      });
+    }
+    if (error instanceof StepFailure) {
+      const { reason, shortReason } = describeStepFailure(error.step, error.output);
+      return recordFailure(env, logger, state, {
+        tag,
+        reason,
+        shortReason,
+        step: error.step,
         output: error.output,
         markTag: true,
         previous: state.current,
       });
     }
-    const step = error instanceof StepFailure ? error.step : "preparation";
-    const output = error instanceof StepFailure ? error.output : "";
     return recordFailure(env, logger, state, {
       tag,
-      reason: `${step} failed`,
-      step,
-      output,
+      reason: "preparation failed",
+      shortReason: shortFailureReason(error?.message ?? "preparation failed"),
+      step: "preparation",
+      output: "",
       markTag: true,
       previous: state.current,
     });
@@ -1230,12 +1458,21 @@ async function runPipeline(env, logger, state, { force, ignoreBackoff }) {
     }
     await healthCheck(env, logger, version);
   } catch (error) {
-    const detail =
-      error instanceof StepFailure
-        ? `${error.step} failed: ${oneLine(lastLines(error.output, 1)[0] ?? "no output")}`
-        : error.message;
-    await logger.error(`switch or health check failed: ${detail}`);
-    return performRollback(env, logger, state, { reason: detail, manual: false, tag });
+    let reason;
+    let details;
+    if (error instanceof StepFailure) {
+      reason = describeStepFailure(error.step, error.output).shortReason;
+      details = summarizeFailure(error.output);
+    } else if (error instanceof HealthFailure) {
+      reason = error.reason ?? error.message;
+      details = summarizeFailure(error.detail ?? error.message);
+    } else {
+      reason = shortFailureReason(error?.message ?? "switch or health check failed");
+      details = summarizeFailure(error?.message ?? "");
+    }
+    await logger.error(`switch or health check failed: ${reason}`);
+    for (const line of details) await logger.error(`  ${line}`);
+    return performRollback(env, logger, state, { reason, details, manual: false, tag });
   }
 
   return recordSuccess(env, logger, state, {
@@ -1665,16 +1902,19 @@ function createSystemAppendLog(config) {
 }
 
 async function systemNotify(config, notification, appendLog) {
-  const title = notification.title ?? "T3 updater";
-  const message = oneLine(notification.message);
+  const title = oneLine(notification.title ?? "T3 updater");
+  const message = String(notification.message ?? "");
   if (config.notifyMode === "stdout") {
-    process.stdout.write(`NOTIFY (macOS): T3 updater — ${message}\n`);
+    process.stdout.write(`NOTIFY (macOS): ${title} — ${oneLine(message)}\n`);
     process.stdout.write(`NOTIFY (T3 thread): ${title} — ${message}\n`);
     return;
   }
   const mac = systemRun(
     "osascript",
-    ["-e", `display notification ${appleScriptString(message)} with title "T3 updater"`],
+    [
+      "-e",
+      `display notification ${appleScriptString(oneLine(message))} with title ${appleScriptString(title)}`,
+    ],
     { timeoutMs: 15_000 },
   );
   if (mac.status !== 0) {

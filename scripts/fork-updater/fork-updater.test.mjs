@@ -2,7 +2,7 @@ import * as NodeAssert from "node:assert/strict";
 import * as NodePath from "node:path";
 import * as NodeTest from "node:test";
 
-import { loadConfig, main } from "./fork-updater.mjs";
+import { loadConfig, main, summarizeFailure } from "./fork-updater.mjs";
 
 const assert = NodeAssert;
 const path = NodePath;
@@ -169,7 +169,16 @@ function createHarness(options = {}) {
     },
     run: async (command, args, opts = {}) => {
       calls.push({ command, args: [...args], opts });
-      return options.run(command, args, opts);
+      const result = await options.run(command, args, opts);
+      if (
+        (command === "vp" || command.endsWith("/vp")) &&
+        args[0] === "i" &&
+        (result.status ?? 0) === 0 &&
+        opts.cwd
+      ) {
+        await fs.writeFile(path.join(opts.cwd, "node_modules", ".bin", "vp"), "");
+      }
+      return result;
     },
     httpGet: async (url, opts) => options.httpGet(url, opts),
     notify: async (notification) => {
@@ -199,11 +208,13 @@ function makeRunner(configuration, options = {}) {
     latestTag: options.latestTag ?? "v0.1.7",
     mergeConflict: options.mergeConflict ?? null,
     typecheckFail: options.typecheckFail ?? null,
+    testsFail: options.testsFail ?? null,
     buildFail: options.buildFail ?? false,
     busy: options.busy ?? false,
     healthDown: options.healthDown ?? options.serviceDown ?? false,
     rollbackFails: options.rollbackFails ?? false,
     sqliteFail: options.sqliteFail ?? false,
+    transcriptionFails: options.transcriptionFails ?? false,
     projects: options.projects ?? [{ id: "p1", title: "Project", workspaceRoot: "/tmp/project" }],
   };
   const isVp = (command) => command === "vp" || command.endsWith("/vp");
@@ -236,6 +247,17 @@ function makeRunner(configuration, options = {}) {
             "src/four.ts:4:4 - error TS1004: fourth",
             "src/five.ts:5:5 - error TS1005: fifth",
             "src/six.ts:6:6 - error TS9999: boom",
+          ].join("\n"),
+        );
+      }
+      if (args[0] === "test" && flags.testsFail !== null) {
+        return failed(
+          [
+            `FAIL ${flags.testsFail}/controller.test.ts > transcribes audio`,
+            "TypeError: Cannot read properties of undefined (reading 'config')",
+            "",
+            " Test Files  1 failed | 12 passed (13)",
+            "      Tests  1 failed | 40 passed (41)",
           ].join("\n"),
         );
       }
@@ -282,6 +304,7 @@ function makeRunner(configuration, options = {}) {
         return ok("thread-1\n");
       }
       if (args[0] === "voice" && args[1] === "transcribe") {
+        if (flags.transcriptionFails) return ok("unintelligible speech\n");
         return ok("hello from the mac mini\n");
       }
       if (args[0] === "--version") return ok(`t3 v${flags.installed}\n`);
@@ -313,6 +336,49 @@ function createReleaseHarness(options = {}) {
   });
 }
 
+test("summarizeFailure keeps informative lines and the test summary", () => {
+  const long = `TypeError: ${"x".repeat(300)}`;
+  const output = [
+    "some decorative line",
+    "TypeError: boom",
+    "FAIL apps/server/src/voice/controller.test.ts",
+    "TypeError: boom",
+    long,
+    "  Test Files  1 failed | 2 passed (3)",
+    "      Tests  1 failed | 9 passed (10)",
+  ].join("\n");
+  const lines = summarizeFailure(output);
+  assert.deepEqual(lines, [
+    "TypeError: boom",
+    "FAIL apps/server/src/voice/controller.test.ts",
+    long.slice(0, 160),
+    "Test Files  1 failed | 2 passed (3)",
+    "Tests  1 failed | 9 passed (10)",
+  ]);
+});
+
+test("summarizeFailure caps at six lines and always keeps the summary", () => {
+  const output = [
+    ...Array.from({ length: 8 }, (_, index) => `Error: failure ${index}`),
+    "  Test Files  1 failed | 2 passed (3)",
+    "      Tests  1 failed | 9 passed (10)",
+  ].join("\n");
+  const lines = summarizeFailure(output);
+  assert.equal(lines.length, 6);
+  assert.deepEqual(lines.slice(4), [
+    "Test Files  1 failed | 2 passed (3)",
+    "Tests  1 failed | 9 passed (10)",
+  ]);
+});
+
+test("summarizeFailure falls back to the last five non-empty lines", () => {
+  assert.deepEqual(
+    summarizeFailure(["one", "", "two", "three", "four", "five", "six"].join("\n")),
+    ["two", "three", "four", "five", "six"],
+  );
+  assert.deepEqual(summarizeFailure("plain\n  ✗ one\n× two\n"), ["✗ one", "× two"]);
+});
+
 test("no new upstream release is a no-op", async () => {
   const harness = createReleaseHarness({ latestTag: "v0.1.6" });
   const result = await main(["tick"], harness.env);
@@ -338,7 +404,16 @@ test("merge conflict notifies FAIL and does not switch", async () => {
   assert.equal(harness.updateCalls().length, 0);
   assert.equal(harness.notifications.length, 1);
   assert.equal(harness.notifications[0].kind, "fail");
-  assert.match(harness.notifications[0].title, /merge conflict in apps\/web\/src\/foo\.ts/);
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: merge conflict in apps/web/src/foo.ts (+1 more), still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /Conflicted files: apps\/web\/src\/foo\.ts, scripts\/bar\.sh/);
+  assert.doesNotMatch(body, /Auto-merging/);
+  assert.match(body, /updater\.log/);
+  assert.match(body, /run-now/);
+  assert.match(body, /rollback/);
   assert.equal(harness.readState().failed.tag, "v0.1.7");
   assert.equal(
     harness.calls.some(({ command, args }) => command === "git" && args.includes("--abort")),
@@ -352,7 +427,16 @@ test("a typecheck failure notifies FAIL with the step and keeps the log", async 
   assert.equal(result.result, "fail");
   assert.equal(harness.updateCalls().length, 0);
   assert.equal(harness.notifications.length, 1);
-  assert.match(harness.notifications[0].title, /typecheck @t3tools\/contracts failed/);
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: typecheck failed (@t3tools/contracts), still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /error TS1001: first/);
+  assert.match(body, /error TS9999: boom/);
+  assert.match(body, /updater\.log/);
+  assert.match(body, /run-now/);
+  assert.match(body, /rollback/);
   assert.match(harness.readLog(), /TS9999: boom/);
   assert.equal(harness.readState().failed.reason, "typecheck @t3tools/contracts failed");
 });
@@ -363,10 +447,11 @@ test("a build failure notifies FAIL and does not switch", async () => {
   assert.equal(result.result, "fail");
   assert.equal(harness.updateCalls().length, 0);
   assert.equal(harness.notifications.length, 1);
-  assert.match(
+  assert.equal(
     harness.notifications[0].title,
-    /building release archive for 0\.1\.7-luke\.1 failed/,
+    "T3 update FAILED: build failed, still on 0.1.6-luke.1",
   );
+  assert.match(harness.notifications[0].message, /web build failed/);
   assert.match(harness.readLog(), /web build failed/);
 });
 
@@ -379,6 +464,36 @@ test("a busy thread leaves the update waiting without switching", async () => {
   assert.match(harness.readLog(), /waiting for idle/);
   assert.equal(harness.readState().lastRun.result, "waiting");
   assert.notEqual(harness.readState().waitingSince, null);
+});
+
+test("vp install uses the tools vp, and later gates use the build worktree vp", async () => {
+  const configuration = config();
+  const toolsVp = configuration.toolsVp;
+  const buildVp = `${BASE}/updater/builds/v0.1.7/node_modules/.bin/vp`;
+  const runner = makeRunner(configuration);
+  const harness = createHarness({
+    configuration,
+    state: initialState(),
+    files: { [toolsVp]: "" },
+    run: runner.run,
+    httpGet: runner.httpGet,
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const install = harness.calls.find(({ command, args }) => command === toolsVp && args[0] === "i");
+  assert.notEqual(install, undefined);
+  const gates = harness.calls.filter(
+    ({ command }) => command !== toolsVp && (command === "vp" || command.endsWith("/vp")),
+  );
+  assert.equal(gates.length, 5);
+  assert.equal(
+    gates.every(({ command }) => command === buildVp),
+    true,
+  );
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === toolsVp && args[0] !== "i"),
+    false,
+  );
 });
 
 test("the success path installs, updates state, and fast-forwards the branch", async () => {
@@ -401,7 +516,8 @@ test("the success path installs, updates state, and fast-forwards the branch", a
   assert.equal(state.history.at(-1).result, "ok");
   assert.equal(harness.notifications.length, 1);
   assert.equal(harness.notifications[0].kind, "ok");
-  assert.match(harness.notifications[0].title, /T3 update: 0\.1\.7-luke\.1 installed/);
+  assert.equal(harness.notifications[0].title, "T3 update: 0.1.7-luke.1 installed");
+  assert.match(harness.notifications[0].message, /updater\.log/);
   assert.equal(
     harness.calls.some(
       ({ command, args }) =>
@@ -425,17 +541,60 @@ test("a health check failure rolls back and names the previous version", async (
   assert.equal(updates[1].args[1], OLD_VERSION);
   assert.equal(harness.notifications.length, 1);
   assert.equal(harness.notifications[0].kind, "fail");
-  assert.match(harness.notifications[0].title, /still on 0\.1\.6-luke\.1/);
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: health check failed (service did not answer), still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /Rolled back to 0\.1\.6-luke\.1/);
+  assert.match(body, /updater\.log/);
   assert.equal(harness.readState().current, OLD_VERSION);
 });
 
-test("a failed rollback notifies ROLLBACK ALSO FAILED", async () => {
+test("a failed rollback keeps the failure title short and explains it in the body", async () => {
   const harness = createReleaseHarness({ healthDown: true, rollbackFails: true });
   const result = await main(["run-now", "--force"], harness.env);
   assert.equal(result.result, "rollback-failed");
   assert.equal(harness.notifications.length, 1);
-  assert.match(harness.notifications[0].title, /ROLLBACK ALSO FAILED/);
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: health check failed (service did not answer), still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /Rollback to 0\.1\.6-luke\.1 also failed/);
+  assert.match(body, /cached release is missing/);
+  assert.doesNotMatch(harness.notifications[0].title, /ROLLBACK ALSO FAILED/);
   assert.equal(harness.readState().lastRun.result, "fail");
+});
+
+test("a focused test failure names the failing path and shows the test summary", async () => {
+  const harness = createReleaseHarness({ testsFail: "apps/server/src/voice" });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "fail");
+  assert.equal(harness.updateCalls().length, 0);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: tests failed (apps/server/src/voice), still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /TypeError: Cannot read properties of undefined \(reading 'config'\)/);
+  assert.match(body, /Test Files {2}1 failed \| 12 passed \(13\)/);
+  assert.match(body, /Tests {2}1 failed \| 40 passed \(41\)/);
+  assert.match(harness.readLog(), /TypeError/);
+});
+
+test("a transcription failure notifies with a short title and detail in the body", async () => {
+  const harness = createReleaseHarness({ transcriptionFails: true });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "rolled-back");
+  assert.equal(
+    harness.notifications[0].title,
+    "T3 update FAILED: transcription check failed, still on 0.1.6-luke.1",
+  );
+  const body = harness.notifications[0].message;
+  assert.match(body, /unintelligible speech/);
+  assert.match(body, /Rolled back to 0\.1\.6-luke\.1/);
 });
 
 test("a down service is restarted once and then reported", async () => {
