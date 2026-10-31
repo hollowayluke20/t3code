@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeHttp from "node:http";
 import * as NodeOS from "node:os";
@@ -13,6 +14,10 @@ const LOCK_STALE_MS = 3 * HOUR_MS;
 const FAILED_TAG_RETRY_MS = 6 * HOUR_MS;
 const BUSY_WAIT_NOTIFY_MS = 12 * HOUR_MS;
 const HEALTH_TIMEOUT_MS = 150_000;
+const SERVER_STOP_TIMEOUT_MS = 60_000;
+const SERVER_KILL_TIMEOUT_MS = 10_000;
+const SERVER_START_TIMEOUT_MS = 30_000;
+const SERVER_POLL_MS = 500;
 const DEFAULT_RUN_TIMEOUT_MS = 5 * 60_000;
 const SQLITE3_BIN = "/usr/bin/sqlite3";
 const PROJECTS_QUERY =
@@ -93,6 +98,10 @@ function statePath(config) {
 
 function logPath(config) {
   return path.join(config.home, "updater.log");
+}
+
+function sandboxServerLogPath(config) {
+  return path.join(config.home, "sandbox-server.log");
 }
 
 function lockPath(config) {
@@ -909,9 +918,62 @@ async function installVersion(env, logger, version, { baseUrl, sandbox } = {}) {
     });
     if ((restarted.status ?? 0) !== 0) {
       await logger.warn(`t3 service restart failed: ${oneLine(combineOutput(restarted))}`);
+    } else if (!(await waitForPortAnswer(env, config.servicePort, SERVER_START_TIMEOUT_MS))) {
+      throw new StepFailure(
+        "service restart",
+        `service did not answer on 127.0.0.1:${config.servicePort} within 30s after restart`,
+      );
     }
   }
   return output;
+}
+
+async function pidAlive(env, pid) {
+  const result = await env.run("kill", ["-0", String(pid)], { timeoutMs: 5_000 });
+  return (result.status ?? 0) === 0;
+}
+
+async function serverAnswers(env, port) {
+  const response = await env.httpGet(`http://127.0.0.1:${port}/`, { timeoutMs: 1_000 });
+  return response.status === 200;
+}
+
+async function waitForServerStopped(env, pid, port, timeoutMs) {
+  const deadline = env.now().getTime() + timeoutMs;
+  while (true) {
+    const alive = await pidAlive(env, pid);
+    const answering = await serverAnswers(env, port);
+    if (!alive && !answering) return true;
+    if (env.now().getTime() >= deadline) return false;
+    await env.sleep(SERVER_POLL_MS);
+  }
+}
+
+async function waitForPortAnswer(env, port, timeoutMs) {
+  const deadline = env.now().getTime() + timeoutMs;
+  while (true) {
+    if (await serverAnswers(env, port)) return true;
+    if (env.now().getTime() >= deadline) return false;
+    await env.sleep(SERVER_POLL_MS);
+  }
+}
+
+async function stopTrackedServer(env, logger, { pid, port, label, step }) {
+  if (!(await pidAlive(env, pid))) {
+    if (await serverAnswers(env, port)) {
+      throw new StepFailure(
+        step,
+        `${label} pid ${pid} is gone but 127.0.0.1:${port} still answers`,
+      );
+    }
+    return;
+  }
+  await env.run("kill", [String(pid)], { timeoutMs: 10_000 });
+  if (await waitForServerStopped(env, pid, port, SERVER_STOP_TIMEOUT_MS)) return;
+  await logger.warn(`${label} pid ${pid} still up after SIGTERM; sending SIGKILL`);
+  await env.run("kill", ["-9", String(pid)], { timeoutMs: 10_000 });
+  if (await waitForServerStopped(env, pid, port, SERVER_KILL_TIMEOUT_MS)) return;
+  throw new StepFailure(step, `${label} pid ${pid} still holds 127.0.0.1:${port} after SIGKILL`);
 }
 
 async function stopSandboxServer(env, logger) {
@@ -920,9 +982,73 @@ async function stopSandboxServer(env, logger) {
   const raw = (await env.fs.readFile(pidFile)).trim();
   if (/^\d+$/.test(raw)) {
     await logger.info(`stopping sandbox server pid ${raw}`);
-    await env.run("kill", [raw], { timeoutMs: 10_000 });
+    await stopTrackedServer(env, logger, {
+      pid: Number(raw),
+      port: env.config.servicePort,
+      label: "sandbox server",
+      step: "sandbox restart",
+    });
   }
   await env.fs.rm(pidFile, { force: true });
+}
+
+async function readSandboxServerLog(env) {
+  try {
+    return await env.fs.readFile(sandboxServerLogPath(env.config));
+  } catch {
+    return "";
+  }
+}
+
+async function sandboxStartFailure(env, result) {
+  const tail = lastLines(await readSandboxServerLog(env), 5);
+  return new StepFailure("sandbox restart", [result.detail, ...tail].join("\n"));
+}
+
+async function launchSandboxServer(env, logger, version) {
+  const binary = path.join(env.config.t3Home, "runtime", "versions", version, "t3");
+  const port = env.config.servicePort;
+  await logger.step(`starting sandbox server ${binary} on port ${port}`);
+  await env.fs.mkdir(env.config.home);
+  const started = await env.run(
+    binary,
+    [
+      "serve",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--base-dir",
+      env.config.t3Home,
+      "--no-browser",
+    ],
+    { detached: true, timeoutMs: 5_000, logFile: sandboxServerLogPath(env.config) },
+  );
+  if (!started.pid) {
+    return { ok: false, exited: true, detail: `could not start ${binary}` };
+  }
+  const pid = started.pid;
+  await env.fs.writeFile(path.join(env.config.home, "sandbox.pid"), `${pid}\n`);
+  const deadline = env.now().getTime() + SERVER_START_TIMEOUT_MS;
+  while (true) {
+    const alive = await pidAlive(env, pid);
+    if (alive && (await serverAnswers(env, port))) return { ok: true, pid };
+    if (!alive) {
+      return {
+        ok: false,
+        exited: true,
+        detail: `${binary} pid ${pid} exited before answering on 127.0.0.1:${port}`,
+      };
+    }
+    if (env.now().getTime() >= deadline) {
+      return {
+        ok: false,
+        exited: false,
+        detail: `${binary} pid ${pid} did not answer on 127.0.0.1:${port} within 30s`,
+      };
+    }
+    await env.sleep(SERVER_POLL_MS);
+  }
 }
 
 async function latestInstalledSandboxVersion(env, state) {
@@ -950,31 +1076,16 @@ async function restartSandboxServer(env, logger, version) {
     );
   }
   await stopSandboxServer(env, logger);
-  const origin = `http://127.0.0.1:${env.config.servicePort}/`;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    const response = await env.httpGet(origin, { timeoutMs: 1_000 });
-    if (response.status !== 200) break;
-    await env.sleep(250);
-  }
-  const binary = path.join(env.config.t3Home, "runtime", "versions", version, "t3");
-  await logger.step(`starting sandbox server ${binary} on port ${env.config.servicePort}`);
-  const started = await env.run(
-    binary,
-    [
-      "serve",
-      "--host",
-      "127.0.0.1",
-      "--port",
-      String(env.config.servicePort),
-      "--base-dir",
-      env.config.t3Home,
-      "--no-browser",
-    ],
-    { detached: true, timeoutMs: 5_000 },
-  );
-  if (!started.pid) throw new StepFailure("sandbox restart", `could not start ${binary}`);
-  await env.fs.mkdir(env.config.home);
-  await env.fs.writeFile(path.join(env.config.home, "sandbox.pid"), `${started.pid}\n`);
+  let result = await launchSandboxServer(env, logger, version);
+  if (result.ok) return result.pid;
+  const firstFailure = await sandboxStartFailure(env, result);
+  if (!result.exited) throw firstFailure;
+  const tail = lastLines(firstFailure.output, 5);
+  await logger.warn(`sandbox server start failed: ${oneLine(tail.join(" | "))}`);
+  await logger.info("retrying sandbox server start once");
+  result = await launchSandboxServer(env, logger, version);
+  if (result.ok) return result.pid;
+  throw await sandboxStartFailure(env, result);
 }
 
 async function waitUntil(env, reason, timeoutMs, attempt) {
@@ -1506,6 +1617,13 @@ async function restartServer(env, logger, state) {
   });
   if ((result.status ?? 0) !== 0) {
     await logger.warn(`t3 service restart failed: ${oneLine(combineOutput(result))}`);
+    return;
+  }
+  if (!(await waitForPortAnswer(env, env.config.servicePort, SERVER_START_TIMEOUT_MS))) {
+    throw new StepFailure(
+      "service restart",
+      `service did not answer on 127.0.0.1:${env.config.servicePort} within 30s after restart`,
+    );
   }
 }
 
@@ -1835,12 +1953,22 @@ function systemRun(command, args, options = {}) {
   }
   const env = { ...process.env, ...options.env, PATH: parts.join(":") };
   if (options.detached) {
+    let logFd = null;
+    if (options.logFile) {
+      try {
+        NodeFS.mkdirSync(path.dirname(options.logFile), { recursive: true });
+        logFd = NodeFS.openSync(options.logFile, "a");
+      } catch {
+        logFd = null;
+      }
+    }
     const child = NodeChildProcess.spawn(command, args, {
       cwd: options.cwd,
       env,
       detached: true,
-      stdio: "ignore",
+      stdio: logFd === null ? "ignore" : ["ignore", logFd, logFd],
     });
+    if (logFd !== null) NodeFS.closeSync(logFd);
     child.on("error", () => {});
     child.unref();
     return { status: child.pid ? 0 : 1, stdout: "", stderr: "", pid: child.pid ?? null };
