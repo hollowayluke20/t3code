@@ -42,6 +42,39 @@ The exact separator (for example `-luke.` or `+luke.`) is whatever the sandbox
 install test recorded in `scripts/fork-updater/SANDBOX-FINDINGS.txt`. The
 updater follows that file, or uses `-luke.<N>` when it is absent.
 
+## Desktop build for Windows and macOS
+
+After a successful switch in service mode, the updater also asks GitHub Actions
+to build the desktop apps on the fork, so the Windows app can update itself from
+the fork's Releases. It runs two commands:
+
+```sh
+git -C <FORK_REPO> push <FORK_REMOTE> <FORK_BRANCH>
+gh workflow run <FORK_WORKFLOW> --repo <FORK_GH_REPO> --ref <FORK_BRANCH> \
+  -f version=<installed version> -f mac=true
+```
+
+The push is a plain push and is never forced. If it is rejected as
+non-fast-forward, the updater stops there, logs it, and tells you. The workflow
+(`fork-release.yml`) builds the Windows installer and, with `mac=true`, the Mac
+DMG, then publishes both as the GitHub release `v<version>` on the fork.
+
+This step never fails the update: the installed version stays in place and you
+get a separate notification instead. In sandbox mode and with `WINDOWS_BUILD=off`
+the step is skipped and only logged.
+
+| Variable        | Default                 | Meaning                                   |
+| --------------- | ----------------------- | ----------------------------------------- |
+| `FORK_REMOTE`   | `fork`                  | Git remote to push the fork branch to     |
+| `FORK_GH_REPO`  | `hollowayluke20/t3code` | Fork repository on GitHub                 |
+| `FORK_WORKFLOW` | `fork-release.yml`      | Workflow file to dispatch                 |
+| `WINDOWS_BUILD` | `on`                    | `off` disables the desktop build entirely |
+
+`status` shows the last desktop build the updater triggered, and then checks the
+release `v<installed version>` with `gh release view` (short timeout). It prints
+the release URL and asset names, or `not published yet` when the release does
+not exist. A missing or broken `gh` never makes `status` fail.
+
 ## Where the files are
 
 | What                                | Where                                                           |
@@ -108,6 +141,7 @@ You get two kinds:
 The thread titles are:
 
 - `T3 update: <version> installed`
+- `T3 update: <version> installed, desktop build NOT started: <short reason>`
 - `T3 update FAILED: <reason>, still on <old version>`
 
 If T3 is down and cannot host a thread, the banner is still sent and the

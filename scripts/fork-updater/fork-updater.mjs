@@ -21,6 +21,9 @@ const SERVER_POLL_MS = 500;
 const CONNECT_TIMEOUT_MS = 30_000;
 const CONNECT_RECOVERY_TIMEOUT_MS = 90_000;
 const CONNECT_POLL_MS = 5_000;
+const FORK_PUSH_TIMEOUT_MS = 5 * 60_000;
+const FORK_DISPATCH_TIMEOUT_MS = 2 * 60_000;
+const RELEASE_VIEW_TIMEOUT_MS = 20_000;
 const DEFAULT_RUN_TIMEOUT_MS = 5 * 60_000;
 const SQLITE3_BIN = "/usr/bin/sqlite3";
 const PROJECTS_QUERY =
@@ -48,6 +51,10 @@ const DEFAULTS = {
   servicePort: 3773,
   forkRepo: "~/Development/t3code-luke",
   forkBranch: "feat/mic-button",
+  forkRemote: "fork",
+  forkGhRepo: "hollowayluke20/t3code",
+  forkWorkflow: "fork-release.yml",
+  windowsBuild: "on",
   upstreamRepo: "pingdotgg/t3code",
   notifyProject: "/Users/adminaccount/Development/grad-application-pipeline",
   switchMode: "service",
@@ -81,6 +88,10 @@ export function loadConfig(envVars = process.env) {
     servicePort: Number(read("SERVICE_PORT", String(DEFAULTS.servicePort))),
     forkRepo: expandHome(read("FORK_REPO", DEFAULTS.forkRepo), home),
     forkBranch: read("FORK_BRANCH", DEFAULTS.forkBranch),
+    forkRemote: read("FORK_REMOTE", DEFAULTS.forkRemote),
+    forkGhRepo: read("FORK_GH_REPO", DEFAULTS.forkGhRepo),
+    forkWorkflow: read("FORK_WORKFLOW", DEFAULTS.forkWorkflow),
+    windowsBuild: read("WINDOWS_BUILD", DEFAULTS.windowsBuild),
     upstreamRepo: read("UPSTREAM_REPO", DEFAULTS.upstreamRepo),
     notifyProject: expandHome(read("NOTIFY_PROJECT", DEFAULTS.notifyProject), home),
     switchMode: read("SWITCH_MODE", DEFAULTS.switchMode),
@@ -133,6 +144,7 @@ function emptyState() {
     waitingNotifiedFor: null,
     lastDownNotifyAt: null,
     lastCrashNotifyAt: null,
+    desktopBuild: null,
   };
 }
 
@@ -1466,6 +1478,119 @@ async function pruneForkVersions(env, logger, state) {
   }
 }
 
+function desktopBuildOff(config) {
+  return (
+    String(config.windowsBuild ?? "")
+      .trim()
+      .toLowerCase() === "off"
+  );
+}
+
+function desktopActionsUrl(config) {
+  return `https://github.com/${config.forkGhRepo}/actions`;
+}
+
+function manualDesktopCommands(config, version) {
+  return [
+    `git -C ${config.forkRepo} push ${config.forkRemote} ${config.forkBranch}`,
+    `gh workflow run ${config.forkWorkflow} --repo ${config.forkGhRepo} --ref ${config.forkBranch} -f version=${version} -f mac=true`,
+  ];
+}
+
+function isPushRejected(output) {
+  return /non-fast-forward|\[rejected\]|updates were rejected|fetch first/i.test(
+    String(output ?? ""),
+  );
+}
+
+async function notifyDesktopBuildProblem(
+  env,
+  logger,
+  state,
+  version,
+  { shortReason, details, result },
+) {
+  const config = env.config;
+  await logger.warn(`desktop build not started: ${shortReason}`);
+  for (const line of details) await logger.warn(`  ${line}`);
+  state.desktopBuild = { version, triggeredAt: env.now().toISOString(), result };
+  await saveState(env, state);
+  const title = `T3 update: ${version} installed, desktop build NOT started: ${shortReason}`;
+  await env.notify({
+    kind: "warn",
+    title,
+    message: [
+      `${title}.`,
+      "",
+      `The update is installed and T3 is running ${version}; only the desktop build did not start.`,
+      ...(details.length > 0 ? ["", ...details] : []),
+      "",
+      "Start it by hand:",
+      ...manualDesktopCommands(config, version).map((command) => `  ${command}`),
+      "",
+      `Log: ${logPath(config)}`,
+    ].join("\n"),
+  });
+}
+
+async function startDesktopBuild(env, logger, state, version) {
+  const config = env.config;
+  if (config.switchMode === "sandbox") {
+    await logger.info("skipping the desktop build (sandbox mode)");
+    return { started: false };
+  }
+  if (desktopBuildOff(config)) {
+    await logger.info("skipping the desktop build (WINDOWS_BUILD=off)");
+    return { started: false };
+  }
+  await logger.step(`pushing ${config.forkBranch} to ${config.forkRemote} for the desktop build`);
+  const push = await env.run(
+    "git",
+    ["-C", config.forkRepo, "push", config.forkRemote, config.forkBranch],
+    { timeoutMs: FORK_PUSH_TIMEOUT_MS },
+  );
+  if ((push.status ?? 0) !== 0) {
+    const output = combineOutput(push);
+    const rejected = isPushRejected(output);
+    await notifyDesktopBuildProblem(env, logger, state, version, {
+      shortReason: rejected ? "push rejected" : "push failed",
+      details: summarizeFailure(output),
+      result: rejected ? "push-rejected" : "push-failed",
+    });
+    return { started: false };
+  }
+  await logger.step(`triggering ${config.forkWorkflow} on ${config.forkGhRepo} for ${version}`);
+  const dispatch = await env.run(
+    "gh",
+    [
+      "workflow",
+      "run",
+      config.forkWorkflow,
+      "--repo",
+      config.forkGhRepo,
+      "--ref",
+      config.forkBranch,
+      "-f",
+      `version=${version}`,
+      "-f",
+      "mac=true",
+    ],
+    { timeoutMs: FORK_DISPATCH_TIMEOUT_MS },
+  );
+  if ((dispatch.status ?? 0) !== 0) {
+    await notifyDesktopBuildProblem(env, logger, state, version, {
+      shortReason: "workflow dispatch failed",
+      details: summarizeFailure(combineOutput(dispatch)),
+      result: "dispatch-failed",
+    });
+    return { started: false };
+  }
+  state.desktopBuild = { version, triggeredAt: env.now().toISOString(), result: "started" };
+  await saveState(env, state);
+  await logger.info(`desktop build triggered: ${desktopActionsUrl(config)}`);
+  return { started: true };
+}
+
 async function recordSuccess(
   env,
   logger,
@@ -1495,6 +1620,9 @@ async function recordSuccess(
   await bestEffort(logger, "pruning old fork versions", () =>
     pruneForkVersions(env, logger, state),
   );
+  const desktop = (await bestEffort(logger, "starting the desktop build", () =>
+    startDesktopBuild(env, logger, state, version),
+  )) ?? { started: false };
   await env.notify({
     kind: "ok",
     title: `T3 update: ${version} installed`,
@@ -1503,6 +1631,9 @@ async function recordSuccess(
       `Log: ${logPath(config)}`,
       "Roll back: node scripts/fork-updater/fork-updater.mjs rollback",
       "Reply to acknowledge in one short line.",
+      ...(desktop.started
+        ? [`Desktop build for Windows/macOS started: ${desktopActionsUrl(config)}`]
+        : []),
     ].join("\n"),
   });
   await logger.info(`installed ${version}`);
@@ -1805,6 +1936,39 @@ async function launchdState(env) {
   return { plist, plistExists, loaded: printed.status === 0 };
 }
 
+async function describeDesktopRelease(env, version) {
+  const config = env.config;
+  let result;
+  try {
+    result = await env.run(
+      "gh",
+      ["release", "view", `v${version}`, "--repo", config.forkGhRepo, "--json", "assets,url"],
+      { timeoutMs: RELEASE_VIEW_TIMEOUT_MS },
+    );
+  } catch (error) {
+    return `unknown (${oneLine(error?.message ?? String(error))})`;
+  }
+  if ((result.status ?? 0) !== 0) {
+    const detail = oneLine(combineOutput(result)) || "gh failed";
+    if (/release not found|HTTP 404|could not find (?:the )?release|no releases?/i.test(detail)) {
+      return "not published yet";
+    }
+    return `unknown (${detail})`;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(String(result.stdout ?? "").trim());
+  } catch {
+    return "unknown (gh release view did not print JSON)";
+  }
+  const url = typeof parsed?.url === "string" ? parsed.url : "";
+  if (url === "") return "not published yet";
+  const assets = (Array.isArray(parsed?.assets) ? parsed.assets : [])
+    .map((asset) => String(asset?.name ?? ""))
+    .filter(Boolean);
+  return `${url} (assets: ${assets.length === 0 ? "none" : assets.join(", ")})`;
+}
+
 async function commandStatus(env) {
   const config = env.config;
   const state = await loadState(env);
@@ -1844,6 +2008,16 @@ async function commandStatus(env) {
   }
   if (state.waitingSince) {
     lines.push(`  waiting for idle since: ${state.waitingSince}`);
+  }
+  if (state.desktopBuild) {
+    lines.push(
+      `  last desktop build: ${state.desktopBuild.version} at ${state.desktopBuild.triggeredAt} (${state.desktopBuild.result})`,
+    );
+  }
+  if (state.current) {
+    lines.push(`  desktop release: ${await describeDesktopRelease(env, state.current)}`);
+  } else {
+    lines.push("  desktop release: no installed fork version");
   }
 
   const response = await env.httpGet(`http://127.0.0.1:${config.servicePort}/`, {

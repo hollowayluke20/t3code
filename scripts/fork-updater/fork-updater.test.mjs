@@ -220,6 +220,15 @@ function makeRunner(configuration, options = {}) {
     rollbackFails: options.rollbackFails ?? false,
     sqliteFail: options.sqliteFail ?? false,
     transcriptionFails: options.transcriptionFails ?? false,
+    pushRejected: options.pushRejected ?? false,
+    pushFails: options.pushFails ?? false,
+    dispatchFails: options.dispatchFails ?? false,
+    releaseMissing: options.releaseMissing ?? false,
+    releaseViewFails: options.releaseViewFails ?? false,
+    release: options.release ?? {
+      url: "https://github.com/hollowayluke20/t3code/releases/tag/v0.1.7-luke.1",
+      assets: [{ name: "T3-Code-0.1.7-luke.1-x64.exe" }],
+    },
     connectBefore: options.connectBefore ?? null,
     connectAfter:
       options.connectAfter !== undefined ? options.connectAfter : (options.connectBefore ?? null),
@@ -257,8 +266,33 @@ function makeRunner(configuration, options = {}) {
   };
   const isVp = (command) => command === "vp" || command.endsWith("/vp");
   const run = async (command, args) => {
-    if (command === "gh") return ok(`${flags.latestTag}\n`);
+    if (command === "gh") {
+      if (args[0] === "workflow" && args[1] === "run") {
+        if (flags.dispatchFails) {
+          return failed("could not create workflow dispatch event: HTTP 404: Not Found");
+        }
+        return ok("");
+      }
+      if (args[0] === "release" && args[1] === "view") {
+        if (flags.releaseMissing) return failed("release not found");
+        if (flags.releaseViewFails) return failed("gh: command not found");
+        return ok(JSON.stringify(flags.release));
+      }
+      return ok(`${flags.latestTag}\n`);
+    }
     if (command === "git") {
+      if (args.includes("push")) {
+        if (flags.pushRejected) {
+          return failed(
+            [
+              "! [rejected]        feat/mic-button -> feat/mic-button (non-fast-forward)",
+              "hint: Updates were rejected because the tip of your current branch is behind",
+            ].join("\n"),
+          );
+        }
+        if (flags.pushFails) return failed("! [remote rejected] (pre-receive hook declined)");
+        return ok("");
+      }
       if (args.includes("merge") && args.includes("--no-edit")) {
         if (flags.mergeConflict) {
           return {
@@ -635,6 +669,192 @@ test("the success path installs, updates state, and fast-forwards the branch", a
     harness.calls.some(({ command, args }) => command === "kill" && args[0] === "4242"),
     true,
   );
+});
+
+test("a successful switch pushes the fork branch and starts the desktop build", async () => {
+  const harness = createReleaseHarness();
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  const push = harness.calls.find(
+    ({ command, args }) => command === "git" && args.includes("push"),
+  );
+  assert.notEqual(push, undefined);
+  assert.deepEqual(push.args, ["-C", harness.config.forkRepo, "push", "fork", "feat/mic-button"]);
+  assert.equal(typeof push.opts.timeoutMs, "number");
+  const dispatch = harness.calls.find(
+    ({ command, args }) => command === "gh" && args[0] === "workflow" && args[1] === "run",
+  );
+  assert.notEqual(dispatch, undefined);
+  assert.deepEqual(dispatch.args, [
+    "workflow",
+    "run",
+    "fork-release.yml",
+    "--repo",
+    "hollowayluke20/t3code",
+    "--ref",
+    "feat/mic-button",
+    "-f",
+    `version=${NEW_VERSION}`,
+    "-f",
+    "mac=true",
+  ]);
+  assert.equal(typeof dispatch.opts.timeoutMs, "number");
+  assert.ok(harness.calls.indexOf(push) < harness.calls.indexOf(dispatch));
+  const state = harness.readState();
+  assert.equal(state.desktopBuild.version, NEW_VERSION);
+  assert.equal(state.desktopBuild.result, "started");
+  assert.equal(typeof state.desktopBuild.triggeredAt, "string");
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].kind, "ok");
+  assert.match(
+    harness.notifications[0].message,
+    /Desktop build for Windows\/macOS started: https:\/\/github\.com\/hollowayluke20\/t3code\/actions/,
+  );
+});
+
+test("a rejected push warns, skips the dispatch, and keeps the update", async () => {
+  const harness = createReleaseHarness({ pushRejected: true });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  assert.equal(harness.readState().current, NEW_VERSION);
+  assert.equal(harness.updateCalls().length, 1);
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "gh" && args[0] === "workflow"),
+    false,
+  );
+  const warn = harness.notifications.find((notification) => notification.kind === "warn");
+  assert.notEqual(warn, undefined);
+  assert.equal(
+    warn.title,
+    `T3 update: ${NEW_VERSION} installed, desktop build NOT started: push rejected`,
+  );
+  assert.match(warn.message, /git -C .* push fork feat\/mic-button/);
+  assert.match(
+    warn.message,
+    /gh workflow run fork-release\.yml --repo hollowayluke20\/t3code --ref feat\/mic-button -f version=0\.1\.7-luke\.1 -f mac=true/,
+  );
+  assert.match(warn.message, /non-fast-forward/);
+  assert.match(harness.readLog(), /desktop build not started: push rejected/);
+  const okNotification = harness.notifications.find((notification) => notification.kind === "ok");
+  assert.notEqual(okNotification, undefined);
+  assert.doesNotMatch(okNotification.message, /Desktop build/);
+  assert.equal(harness.readState().desktopBuild.result, "push-rejected");
+});
+
+test("a failed workflow dispatch still installs the update and notifies separately", async () => {
+  const harness = createReleaseHarness({ dispatchFails: true });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  assert.equal(harness.readState().current, NEW_VERSION);
+  assert.equal(harness.notifications.length, 2);
+  const warn = harness.notifications.find((notification) => notification.kind === "warn");
+  assert.notEqual(warn, undefined);
+  assert.equal(
+    warn.title,
+    `T3 update: ${NEW_VERSION} installed, desktop build NOT started: workflow dispatch failed`,
+  );
+  assert.match(warn.message, /HTTP 404/);
+  assert.match(warn.message, /gh workflow run fork-release\.yml/);
+  assert.equal(harness.readState().desktopBuild.result, "dispatch-failed");
+  const okNotification = harness.notifications.find((notification) => notification.kind === "ok");
+  assert.doesNotMatch(okNotification.message, /Desktop build/);
+});
+
+test("WINDOWS_BUILD=off skips the desktop build entirely", async () => {
+  const harness = createReleaseHarness({ config: { windowsBuild: "off" } });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "git" && args.includes("push")),
+    false,
+  );
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "gh" && args[0] === "workflow"),
+    false,
+  );
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].kind, "ok");
+  assert.doesNotMatch(harness.notifications[0].message, /Desktop build/);
+  assert.equal(harness.readState().desktopBuild, null);
+  assert.match(harness.readLog(), /skipping the desktop build \(WINDOWS_BUILD=off\)/);
+});
+
+test("sandbox mode does not start the desktop build", async () => {
+  const harness = createReleaseHarness({
+    config: { switchMode: "sandbox", t3Home: `${BASE}/sandbox-t3home` },
+    files: { [`${BASE}/updater/sandbox.pid`]: "4242\n" },
+  });
+  const result = await main(["run-now", "--force"], harness.env);
+  assert.equal(result.result, "ok");
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "git" && args.includes("push")),
+    false,
+  );
+  assert.equal(
+    harness.calls.some(({ command, args }) => command === "gh" && args[0] === "workflow"),
+    false,
+  );
+  assert.equal(harness.notifications.length, 1);
+  assert.match(harness.readLog(), /skipping the desktop build \(sandbox mode\)/);
+  assert.equal(harness.readState().desktopBuild, null);
+});
+
+test("status shows the last desktop build and the release assets", async () => {
+  const harness = createReleaseHarness({
+    state: initialState({
+      current: NEW_VERSION,
+      desktopBuild: {
+        version: NEW_VERSION,
+        triggeredAt: "2026-10-31T12:05:00.000Z",
+        result: "started",
+      },
+    }),
+    release: {
+      url: "https://github.com/hollowayluke20/t3code/releases/tag/v0.1.7-luke.1",
+      assets: [
+        { name: "T3-Code-0.1.7-luke.1-x64.exe" },
+        { name: "T3-Code-0.1.7-luke.1-arm64.dmg" },
+      ],
+    },
+  });
+  const result = await main(["status"], harness.env);
+  assert.equal(result.exitCode, 0);
+  const text = harness.output.join("\n");
+  assert.match(
+    text,
+    /last desktop build: 0\.1\.7-luke\.1 at 2026-10-31T12:05:00\.000Z \(started\)/,
+  );
+  const release = harness.calls.find(
+    ({ command, args }) => command === "gh" && args[0] === "release" && args[1] === "view",
+  );
+  assert.notEqual(release, undefined);
+  assert.deepEqual(release.args, [
+    "release",
+    "view",
+    "v0.1.7-luke.1",
+    "--repo",
+    "hollowayluke20/t3code",
+    "--json",
+    "assets,url",
+  ]);
+  assert.equal(typeof release.opts.timeoutMs, "number");
+  assert.match(text, /releases\/tag\/v0\.1\.7-luke\.1/);
+  assert.match(text, /T3-Code-0\.1\.7-luke\.1-x64\.exe/);
+  assert.match(text, /T3-Code-0\.1\.7-luke\.1-arm64\.dmg/);
+});
+
+test("status says not published yet when the release is missing", async () => {
+  const harness = createReleaseHarness({ releaseMissing: true });
+  const result = await main(["status"], harness.env);
+  assert.equal(result.exitCode, 0);
+  assert.match(harness.output.join("\n"), /desktop release: not published yet/);
+});
+
+test("status never fails when gh is missing", async () => {
+  const harness = createReleaseHarness({ releaseViewFails: true });
+  const result = await main(["status"], harness.env);
+  assert.equal(result.exitCode, 0);
+  assert.match(harness.output.join("\n"), /desktop release: unknown \(gh: command not found\)/);
 });
 
 test("a health check failure rolls back and names the previous version", async () => {
