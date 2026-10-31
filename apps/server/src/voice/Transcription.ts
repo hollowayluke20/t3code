@@ -18,10 +18,15 @@ import * as ProcessRunner from "../processRunner.ts";
 export const VOICE_MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const WHISPER_TIMEOUT = "5 minutes";
 
+const DEFAULT_VOICE_DIR = ".t3-voice";
+
 const isWav = (bytes: Uint8Array): boolean =>
   bytes.byteLength >= 12 &&
   String.fromCharCode(...bytes.subarray(0, 4)) === "RIFF" &&
   String.fromCharCode(...bytes.subarray(8, 12)) === "WAVE";
+
+const modelPreference = (name: string): number =>
+  name.includes("large-v3-turbo") ? 0 : name.includes("small") ? 1 : 2;
 
 const fail = (reason: "unavailable" | "invalid-audio" | "too-large" | "failed", message: string) =>
   Effect.fail(new VoiceTranscribeError({ reason, message }));
@@ -48,21 +53,40 @@ const make = Effect.gen(function* () {
 
   // The transcribe span already covers configuration lookup.
   const resolveWhisper = Effect.fnUntraced(function* (environment: NodeJS.ProcessEnv) {
+    const home = yield* HostProcess.HomeDirectory;
+    const defaultModelsDir = path.join(home, DEFAULT_VOICE_DIR, "models");
+    const defaultBinary = path.join(home, DEFAULT_VOICE_DIR, "bin", "whisper-cli");
+
     const configuredModel = environment.T3CODE_WHISPER_MODEL?.trim();
-    if (configuredModel === undefined || configuredModel.length === 0) {
-      return yield* fail(
-        "unavailable",
-        "Voice transcription is unavailable: set T3CODE_WHISPER_MODEL to a whisper.cpp ggml model file.",
-      );
-    }
-    const modelExists = yield* fileSystem
-      .exists(configuredModel)
-      .pipe(Effect.orElseSucceed(() => false));
-    if (!modelExists) {
-      return yield* fail(
-        "unavailable",
-        `Voice transcription is unavailable: T3CODE_WHISPER_MODEL points to a missing file (${configuredModel}).`,
-      );
+    let model: string;
+    if (configuredModel !== undefined && configuredModel.length > 0) {
+      const modelExists = yield* fileSystem
+        .exists(configuredModel)
+        .pipe(Effect.orElseSucceed(() => false));
+      if (!modelExists) {
+        return yield* fail(
+          "unavailable",
+          `Voice transcription is unavailable: T3CODE_WHISPER_MODEL points to a missing file (${configuredModel}).`,
+        );
+      }
+      model = configuredModel;
+    } else {
+      const modelNames = yield* fileSystem
+        .readDirectory(defaultModelsDir)
+        .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
+      const defaultModelName = modelNames
+        .filter((name) => name.startsWith("ggml-") && name.endsWith(".bin"))
+        .toSorted(
+          (left, right) =>
+            modelPreference(left) - modelPreference(right) || left.localeCompare(right),
+        )[0];
+      if (defaultModelName === undefined) {
+        return yield* fail(
+          "unavailable",
+          `Voice transcription is unavailable: set T3CODE_WHISPER_MODEL to a whisper.cpp ggml model file, or put one in ${defaultModelsDir}.`,
+        );
+      }
+      model = path.join(defaultModelsDir, defaultModelName);
     }
 
     const configuredBinary = environment.T3CODE_WHISPER_BIN?.trim();
@@ -73,17 +97,20 @@ const make = Effect.gen(function* () {
           `Voice transcription is unavailable: T3CODE_WHISPER_BIN is not an executable file (${configuredBinary}).`,
         );
       }
-      return { binary: configuredBinary, model: configuredModel };
+      return { binary: configuredBinary, model };
     }
 
     for (const candidate of ["whisper-cli", "whisper-cpp"] as const) {
       if (yield* commandAvailable(candidate, environment)) {
-        return { binary: candidate, model: configuredModel };
+        return { binary: candidate, model };
       }
+    }
+    if (yield* commandAvailable(defaultBinary, environment)) {
+      return { binary: defaultBinary, model };
     }
     return yield* fail(
       "unavailable",
-      "Voice transcription is unavailable: install whisper.cpp (whisper-cli), put it on PATH, or set T3CODE_WHISPER_BIN.",
+      `Voice transcription is unavailable: install whisper.cpp (whisper-cli), put it on PATH or in ${path.dirname(defaultBinary)}, or set T3CODE_WHISPER_BIN.`,
     );
   });
 
